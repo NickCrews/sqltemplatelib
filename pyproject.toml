@@ -1,0 +1,69 @@
+[project]
+name = "sqltemplatelib"
+version = "0.1.0.dev0"
+description = "Composable, injection-safe SQL templates built on Python t-strings (PEP 750)"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Nick Crews", email = "nicholas.b.crews@gmail.com" }]
+requires-python = ">=3.10"
+dependencies = []
+keywords = ["sql", "t-strings", "pep750", "templates", "templatelib", "sql-injection"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Database",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Repository = "https://github.com/NickCrews/sqltemplatelib"
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.12", "mypy>=1.16"]
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+extend-exclude = [".venv*"]
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "COM812",  # conflicts with formatter
+    "D203",    # incompatible with D211
+    "D213",    # incompatible with D212
+    "A001",    # `compile` intentionally shadows the builtin
+    "A004",
+    "PLR2004", # magic values
+    "PLR0911", # too many returns
+    "PLR0912", # too many branches
+    "C901",    # complexity
+    "CPY001",  # copyright header
+    "D105",    # docstrings on magic methods
+    "D107",    # docstrings on __init__
+    "S101",    # asserts for internal invariants
+    "PLW1641", # __eq__ without __hash__ is intentionally unhashable
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D", "S101", "ANN", "ARG", "PLC0415", "INP001", "SLF001", "PT011", "N801", "FBT"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.per-file-target-version]
+"tests/test_tstrings.py" = "py314"
+
+[tool.mypy]
+strict = true
+files = ["src"]
