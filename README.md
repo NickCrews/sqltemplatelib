@@ -133,7 +133,6 @@ This package focuses on the part those don't share: a common protocol so objects
 
 - Identifiers and literals. `!s` inserts raw text. psycopg uses `:i` / `:l` format specs that quote correctly. Quoting is dialect-specific, so supporting it needs a dialect hook alongside `paramstyle`.
 - Default paramstyle. `dollar` comes from DuckDB. A neutral library could instead require it.
-- Optional clauses, like sql-tstring's `Absent`.
 - A `join()` helper for building lists of fragments.
 
 ## Development
