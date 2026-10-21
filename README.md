@@ -6,7 +6,7 @@ Composable, injection-safe SQL templates built on Python [t-strings](https://doc
 - Templates nest, so subqueries and reusable fragments compose.
 - Any object can take part by implementing `__sql_template__()`. Libraries can implement it without depending on this package.
 - Compiles to any DB-API paramstyle: DuckDB, sqlite3, psycopg, asyncpg, and others.
-- Pure Python, zero runtime dependencies, Python 3.10+. t-string syntax needs 3.14; on older versions, build templates with `template(...)`.
+- Pure Python, zero runtime dependencies, Python 3.11+. t-string syntax needs 3.14; on older versions, build templates with `template(...)`.
 
 Status: pre-alpha. The API is extracted from [duckdb/duckdb-python#409](https://github.com/duckdb/duckdb-python/pull/409) and may change.
 

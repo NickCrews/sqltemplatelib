@@ -21,11 +21,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        python: ["3.11", "3.12", "3.13", "3.14", "3.15"]
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
       - run: uv sync -p ${{ matrix.python }}
       - run: uv run pytest
-      - if: matrix.python == '3.14'
+      - if: matrix.python == '3.14' || matrix.python == '3.15'
         run: uv run python -m doctest src/sqltemplatelib/__init__.py

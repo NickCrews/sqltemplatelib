@@ -6,7 +6,7 @@ import dataclasses
 import re
 from collections import Counter
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Literal, NoReturn, Protocol, TypeVar, runtime_checkable
+from typing import TYPE_CHECKING, Literal, Never, Protocol, TypeVar, runtime_checkable
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -69,7 +69,7 @@ class CompiledSql:
     sql: str
     params: dict[str, object] | tuple[object, ...] = dataclasses.field(default_factory=dict)
 
-    def __str__(self) -> NoReturn:
+    def __str__(self) -> Never:
         """Disallow accidentally converting to a string, since that would lose the parameters."""
         msg = "CompiledSql cannot be directly converted to a string, since it may contain parameters. Please use the .sql attribute for the SQL string, and the .params attribute for the parameters."  # noqa: E501
         raise NotImplementedError(msg)
@@ -356,7 +356,7 @@ class SqlTemplate:
         """Compile this template into a final SQL string with parameter placeholders, and the params."""
         return self.resolve().compile(paramstyle=paramstyle)
 
-    def __str__(self) -> NoReturn:
+    def __str__(self) -> Never:
         msg = "SqlTemplate cannot be directly converted to a string, since it may contain unresolved interpolations. Please call .resolve() or .compile() first."  # noqa: E501
         raise NotImplementedError(msg)
 
@@ -375,7 +375,7 @@ class ResolvedSqlTemplate:
         """Compile this template into a final SQL string with parameter placeholders, and the params."""
         return compile_parts(self.parts, paramstyle=paramstyle)
 
-    def __str__(self) -> NoReturn:
+    def __str__(self) -> Never:
         msg = "ResolvedSqlTemplate cannot be directly converted to a string, since it may contain parameters. Please call .compile() first."  # noqa: E501
         raise NotImplementedError(msg)
 
