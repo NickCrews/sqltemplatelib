@@ -39,7 +39,7 @@ AGE_QUERY = ("SELECT * FROM people WHERE age >= ", param(18, "age"), " AND name 
     ],
 )
 def test_paramstyles(paramstyle, sql, params):
-    compiled = compile(*AGE_QUERY, compiler=DbApiCompiler(paramstyle=paramstyle))
+    compiled = compile(AGE_QUERY, compiler=DbApiCompiler(paramstyle=paramstyle))
     assert compiled.sql == sql
     assert compiled.params == params
 
@@ -49,8 +49,35 @@ def test_all_paramstyles_covered():
 
 
 def test_default_compiler_is_sqlite3():
-    assert compile("SELECT ", 1) == CompiledSql("SELECT ?", (1,))
+    assert compile(["SELECT ", 1]) == CompiledSql("SELECT ?", (1,))
     assert template("SELECT ", 1).compile() == CompiledSql("SELECT ?", (1,))
+
+
+def test_compile_takes_compiler_positionally():
+    assert compile(["SELECT ", 1], "duckdb") == CompiledSql("SELECT $p0", {"p0": 1})
+
+
+def test_compile_takes_compiler_keyword():
+    assert compile(["SELECT ", 1], compiler="duckdb") == CompiledSql("SELECT $p0", {"p0": 1})
+
+
+@pytest.mark.parametrize(
+    "parts",
+    [
+        ["SELECT ", 1],
+        ("SELECT ", 1),
+        (p for p in ["SELECT ", 1]),
+        iter(["SELECT ", 1]),
+    ],
+    ids=["list", "tuple", "generator", "iterator"],
+)
+def test_compile_joins_any_iterable(parts):
+    assert compile(parts) == CompiledSql("SELECT ?", (1,))
+
+
+def test_compile_does_not_iterate_str_or_bytes():
+    assert compile("SELECT 1") == CompiledSql("SELECT 1", ())
+    assert compile(b"abc") == CompiledSql("?", (b"abc",))
 
 
 def test_unknown_paramstyle_raises():
@@ -91,7 +118,7 @@ def _dbapi(paramstyle):
 
 @pytest.mark.parametrize("paramstyle", ["pyformat", "format"])
 def test_percent_escaped_for_percent_styles(paramstyle):
-    compiled = compile("SELECT 10 % 3, 'a%' LIKE ", "x", compiler=_dbapi(paramstyle))
+    compiled = compile(["SELECT 10 % 3, 'a%' LIKE ", "x"], compiler=_dbapi(paramstyle))
     assert compiled.sql.startswith("SELECT 10 %% 3, 'a%%' LIKE ")
 
 
@@ -103,12 +130,12 @@ def test_percent_not_escaped_for_other_styles(paramstyle):
 def test_duplicate_exact_names_raise_for_named_styles():
     parts = (param(1, "x", exact=True), param(2, "x", exact=True))
     with pytest.raises(ValueError, match="Duplicate parameter names"):
-        compile(*parts, compiler=_dbapi("named"))
+        compile(parts, compiler=_dbapi("named"))
 
 
 def test_duplicate_exact_names_ok_for_positional_styles():
     parts = (param(1, "x", exact=True), param(2, "x", exact=True))
-    assert compile(*parts, compiler=_dbapi("qmark")).params == (1, 2)
+    assert compile(parts, compiler=_dbapi("qmark")).params == (1, 2)
 
 
 def test_compile_method_accepts_compiler_positionally():
@@ -162,14 +189,14 @@ class TestRegistry:
                 return CompiledSql(sql=sql.upper(), params=tuple(p.value for p in parts if isinstance(p, Param)))
 
         register_compiler("upper", UppercaseCompiler())
-        assert compile("select ", 1, compiler="upper").sql == "SELECT ?"
+        assert compile(["select ", 1], compiler="upper").sql == "SELECT ?"
 
     @pytest.mark.usefixtures("restore_registry")
     def test_register_existing_name_raises_without_overwrite(self):
         with pytest.raises(ValueError, match="already registered"):
             register_compiler("sqlite3", DbApiCompiler("dollar"))
         register_compiler("sqlite3", DbApiCompiler("dollar"), overwrite=True)
-        assert compile("SELECT ", 1).sql == "SELECT $p0"
+        assert compile(["SELECT ", 1]).sql == "SELECT $p0"
 
     def test_register_non_compiler_raises(self):
         with pytest.raises(TypeError, match="Expected a Compiler"):
@@ -218,7 +245,7 @@ class TestParamNames:
 
 def test_plain_str_part_is_raw_sql():
     # Outside a t-string, a str part is SQL text, not a value. Wrap values in param().
-    assert compile("SELECT ", "1 + 1").sql == "SELECT 1 + 1"
+    assert compile(["SELECT ", "1 + 1"]).sql == "SELECT 1 + 1"
 
 
 class TestSqlite3:
@@ -241,6 +268,22 @@ class TestSqlite3:
 
     def test_injection_is_a_param(self, conn):
         evil = "x'; DROP TABLE people; --"
-        compiled = compile("SELECT count(*) FROM people WHERE name = ", param(evil), compiler="sqlite3")
+        compiled = compile(["SELECT count(*) FROM people WHERE name = ", param(evil)], compiler="sqlite3")
         assert conn.execute(compiled.sql, compiled.params).fetchall() == [(0,)]
         assert conn.execute("SELECT count(*) FROM people").fetchall() == [(3,)]
+
+    def test_readme_example_without_tstrings(self, conn):
+        # The README quickstart, written with lists for Python < 3.14.
+        # A plain str part is raw SQL, so the user-supplied name must go through param().
+        min_age = 18
+        adults = ["SELECT * FROM people WHERE age >= ", min_age]
+
+        name = "x'; DROP TABLE people; -- Evil Hacker"
+        query = ["SELECT name FROM (", adults, ") WHERE name != ", param(name)]
+
+        c = compile(query, "sqlite3")
+        assert c == CompiledSql(
+            "SELECT name FROM (SELECT * FROM people WHERE age >= ?) WHERE name != ?",
+            (18, "x'; DROP TABLE people; -- Evil Hacker"),
+        )
+        assert sorted(conn.execute(c.sql, c.params).fetchall()) == [("Al",), ("Cy",)]

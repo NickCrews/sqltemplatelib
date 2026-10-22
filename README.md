@@ -10,19 +10,21 @@ Composable, injection-safe SQL templates built on Python [t-strings](https://doc
 
 Status: pre-alpha. The API is extracted from [duckdb/duckdb-python#409](https://github.com/duckdb/duckdb-python/pull/409) and may change.
 
-## Quickstart
+## Usage As End User
 
 ```python
 import sqlite3
-from sqltemplatelib import template
+from sqltemplatelib import compile
 
 min_age = 18
-adults = template(t"SELECT * FROM people WHERE age >= {min_age}")
+adults = t"SELECT * FROM people WHERE age >= {min_age}"
+# if on python <3.14, can also do
+# adults = ["SELECT * FROM people WHERE age >= ", sqltemplatelib.param(min_age)]
 
 name = "x'; DROP TABLE people; -- Evil Hacker"
-query = template(t"SELECT name FROM ({adults}) WHERE name != {name}")
+query = t"SELECT name FROM ({adults}) WHERE name != {name}"
 
-c = query.compile("sqlite3")
+c = compile(query, "sqlite3")
 # CompiledSql(sql='SELECT name FROM (SELECT * FROM people WHERE age >= ?) WHERE name != ?',
 #             params=(18, "x'; DROP TABLE people; -- Evil Hacker"))
 sqlite3.connect(":memory:").execute(c.sql, c.params)

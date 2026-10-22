@@ -257,15 +257,25 @@ def template(*parts: str | IntoInterpolation | Param | SupportsSqlTemplate | obj
 
 
 def compile(
-    *parts: str | IntoInterpolation | Param | SupportsSqlTemplate | object,
+    obj: str | IntoInterpolation | Param | SupportsSqlTemplate | object,
+    /,
     compiler: str | Compiler = "sqlite3",
 ) -> CompiledSql:
-    """Compile a sequence of things into a final SQL string with parameter placeholders, and the params.
+    """Compile something into a final SQL string with parameter placeholders, and the params.
 
     This is a convenience function that combines template() and .compile() into one step.
+    `obj` is anything template() accepts as a single part,
+    so an iterable joins several parts.
     See SqlTemplate.compile() for `compiler`, and template() for more examples.
+
+    >>> age = 18
+    >>> compile(t"SELECT * FROM people WHERE age >= {age}", "duckdb")
+    CompiledSql(sql='SELECT * FROM people WHERE age >= $p0_age', params={'p0_age': 18})
+    >>> parts = ["SELECT * FROM people WHERE age >= ", age]
+    >>> compile(parts, "duckdb")
+    CompiledSql(sql='SELECT * FROM people WHERE age >= $p0_age', params={'p0_age': 18})
     """
-    return template(*parts).compile(compiler)
+    return template(obj).compile(compiler)
 
 
 def _is_iterable_nonstring(value: object) -> TypeIs[Iterable[object]]:
@@ -689,7 +699,7 @@ def register_compiler(name: str, compiler: Compiler, *, overwrite: bool = False)
     Raises ValueError if the name is already registered, unless overwrite=True.
 
     >>> register_compiler("myapp.sqlite3_named", DbApiCompiler("named"))
-    >>> compile("SELECT ", param(1, "x"), compiler="myapp.sqlite3_named")
+    >>> compile(["SELECT ", param(1, "x")], "myapp.sqlite3_named")
     CompiledSql(sql='SELECT :p0_x', params={'p0_x': 1})
     """
     if not isinstance(compiler, Compiler):

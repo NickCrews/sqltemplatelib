@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import sqlite3
 import sys
 
 import pytest
 
 from sqltemplatelib import (
+    CompiledSql,
     Param,
+    compile,
     param,
     template,
 )
@@ -176,3 +179,31 @@ class TestTStringEdgeCases:
         evil = "1; DROP TABLE users; --"
         result = template(t"SELECT * FROM users WHERE id = {evil!s}").compile("duckdb")
         assert "DROP TABLE" in result.sql
+
+
+class TestReadmeExample:
+    @pytest.fixture
+    def conn(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE people (name TEXT, age INTEGER)")
+        conn.executemany("INSERT INTO people VALUES (?, ?)", [("Al", 30), ("Bo", 12), ("Cy", 50)])
+        yield conn
+        conn.close()
+
+    @pytest.mark.parametrize("adults_form", ["tstring", "list"])
+    def test_quickstart(self, conn, adults_form):
+        min_age = 18
+        if adults_form == "tstring":
+            adults = t"SELECT * FROM people WHERE age >= {min_age}"
+        else:
+            adults = ["SELECT * FROM people WHERE age >= ", param(min_age)]
+
+        name = "x'; DROP TABLE people; -- Evil Hacker"
+        query = t"SELECT name FROM ({adults}) WHERE name != {name}"
+
+        c = compile(query, "sqlite3")
+        assert c == CompiledSql(
+            "SELECT name FROM (SELECT * FROM people WHERE age >= ?) WHERE name != ?",
+            (18, "x'; DROP TABLE people; -- Evil Hacker"),
+        )
+        assert sorted(conn.execute(c.sql, c.params).fetchall()) == [("Al",), ("Cy",)]
