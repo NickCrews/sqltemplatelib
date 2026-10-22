@@ -69,7 +69,6 @@ def test_duplicate_exact_names_ok_for_positional_styles():
 def test_compile_method_accepts_paramstyle():
     t = template("SELECT ", 1)
     assert t.compile(paramstyle="qmark").params == (1,)
-    assert t.resolve().compile(paramstyle="qmark").params == (1,)
 
 
 class TestParamNames:

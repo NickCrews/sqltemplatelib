@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import dataclasses
 import re
+import sys
 from collections import Counter
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Literal, Never, Protocol, TypeVar, runtime_checkable
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from types import FrameType
 
     from typing_extensions import TypeIs
 
@@ -19,7 +21,6 @@ __all__ = [
     "IntoInterpolation",
     "Param",
     "ParamStyle",
-    "ResolvedSqlTemplate",
     "SqlTemplate",
     "SupportsSqlTemplate",
     "compile",
@@ -56,7 +57,7 @@ class CompiledSql:
     `params` is a dict for named paramstyles and a tuple for positional ones.
 
     You will typically not create this directly, but will get it as the result
-    of calling .compile() on a SqlTemplate or ResolvedSqlTemplate.
+    of calling .compile() on a SqlTemplate.
 
     Example:
     >>> age = 37
@@ -130,8 +131,8 @@ def template(*parts: str | IntoInterpolation | Param | SupportsSqlTemplate | obj
 
     We go through the parts and convert it into a sequence of str and Interpolations,
     which we then hand off to SqlTemplate.
-    - If the thing has a `.__sql_template__()` method, call it,
-      and call template() recursively on the result.
+    - If the thing is a SqlTemplate or has a `.__sql_template__()` method,
+      wrap it in an Interpolation, to be expanded at compile time.
     - If the thing is a `str`, treat it as raw SQL.
     - If it's an Interpolation, leave it as is, treating it as an interpolation.
     - If it's a Param, wrap it in an Interpolation.
@@ -172,6 +173,8 @@ def template(*parts: str | IntoInterpolation | Param | SupportsSqlTemplate | obj
 
     You can define evaluation logic for your custom types by defining a `.__sql_template__()` method.
     If this method is defined, the result of that call will be used to create the template.
+    The method is called when the template is compiled, not when it is built,
+    so the compiled SQL reflects the object's state at compile time.
 
     >>> class Record:
     ...     def __init__(self, table_name: str, id: int):
@@ -209,19 +212,8 @@ def _is_iterable_nonstring(value: object) -> TypeIs[Iterable[object]]:
 
 
 def _expand_part(part: object) -> Iterable[str | IntoInterpolation]:
-    if isinstance(part, SupportsSqlTemplate):
-        raw = part.__sql_template__()
-        if isinstance(raw, str):  # noqa: SIM114
-            yield raw
-        elif isinstance(raw, IntoInterpolation):
-            yield raw
-        elif isinstance(raw, Param):
-            yield ParamInterpolation(raw)
-        elif _is_iterable_nonstring(raw):
-            for item in raw:
-                yield from _expand_part(item)
-        else:
-            yield ParamInterpolation(param(value=raw))
+    if isinstance(part, SqlTemplate | SupportsSqlTemplate):
+        yield DeferredInterpolation(part)
     elif isinstance(part, str):  # noqa: SIM114
         yield part
     elif isinstance(part, IntoInterpolation):
@@ -253,15 +245,44 @@ class ParamInterpolation:
         return repr(self.value)
 
 
-def _resolve(parts: Iterable[str | IntoInterpolation]) -> ResolvedSqlTemplate:
-    """Resolve a stream of strings and Interpolations, recursively resolving inner interpolations."""
+class DeferredInterpolation:
+    """Implements the IntoInterpolation protocol for a SqlTemplate or SupportsSqlTemplate, expanded at compile time."""
+
+    value: object
+    expression: str | None
+    conversion: Literal["s", "r", "a"] | None
+    format_spec: str
+
+    def __init__(self, value: SqlTemplate | SupportsSqlTemplate) -> None:
+        self.value = value
+        self.expression = None
+        self.conversion = None
+        self.format_spec = ""
+
+    def __repr__(self) -> str:
+        return repr(self.value)
+
+
+def _resolve(parts: Iterable[str | IntoInterpolation], site: tuple[str, int] | None = None) -> list[str | Param]:
+    """Resolve a stream of strings and Interpolations into strings and Params, recursing into nested templates.
+
+    `site` is where the enclosing SqlTemplate was created, if known.
+    Errors get a note naming the interpolation that failed and that site,
+    since resolution happens at compile time, far from where the template was written.
+    """
     resolved: list[str | Param] = []
     for part in parts:
         if isinstance(part, str):
             resolved.append(part)
-        else:
+            continue
+        try:
             resolved.extend(_resolve_interpolation(part))
-    return ResolvedSqlTemplate(resolved)
+        except Exception as e:
+            what = f"{{{part.expression}}}" if part.expression else f"{type(part.value).__name__} object"
+            where = f" in SqlTemplate created at {_format_site(site)}" if site else ""
+            e.add_note(f"while expanding {what}{where}")
+            raise
+    return resolved
 
 
 def _resolve_interpolation(interp: IntoInterpolation) -> Iterable[str | Param]:
@@ -294,15 +315,28 @@ def _resolve_interpolation(interp: IntoInterpolation) -> Iterable[str | Param]:
         return (format(converted, interp.format_spec),)
 
     if isinstance(value, str):
-        # Do NOT pass to template(), since that would treat it as raw SQL.
+        # Do NOT pass to _expand_part(), since that would treat it as raw SQL.
         return (param(value, name=interp.expression),)
-    templ = template(value)
-    # If the value expands to a single param, keep the interpolation's expression as its name,
+    parts: tuple[str | IntoInterpolation, ...]
+    site: tuple[str, int] | None
+    if isinstance(value, SqlTemplate):
+        parts, site = tuple(value), value._site  # noqa: SLF001
+    elif isinstance(value, SupportsSqlTemplate):
+        parts, site = tuple(_expand_part(value.__sql_template__())), None
+    else:
+        parts, site = tuple(_expand_part(value)), None
+    # If the value expands to a single unnamed param, name it after the interpolation's expression,
     # eg `{age}` compiles to `$p0_age` rather than `$p0`.
-    if len(templ.strings) == 2 and templ.strings[0] == "" and templ.strings[1] == "" and len(templ.interpolations) == 1:
-        return (param(value, name=interp.expression),)
+    non_empty = [part for part in parts if part != ""]
+    if (
+        len(non_empty) == 1
+        and isinstance(only := non_empty[0], ParamInterpolation)
+        and isinstance(p := only.value, Param)
+        and p.name is None
+    ):
+        return (param(p.value, name=interp.expression),)
     # Nested template, eg a subquery.
-    return _resolve(templ)
+    return _resolve(parts, site)
 
 
 @runtime_checkable
@@ -331,7 +365,12 @@ def _sanitize_name_suffix(name: str) -> str:
 
 
 class SqlTemplate:
-    """A sequence of strings and Interpolations."""
+    """A sequence of strings and Interpolations.
+
+    Interpolations are expanded into SQL text and Params when the template is compiled.
+    The template records the file and line where it was created,
+    so that errors raised while compiling can point back to it.
+    """
 
     def __init__(self, *parts: str | IntoInterpolation) -> None:
         for part in parts:
@@ -340,6 +379,7 @@ class SqlTemplate:
                 msg = f"Unexpected part type in SqlTemplate: {type(part).__name__}. Expected str or IntoInterpolation."
                 raise TypeError(msg)
         self.strings, self.interpolations = parse_parts(parts)
+        self._site = _caller_site()
 
     def __iter__(self) -> Iterator[str | IntoInterpolation]:
         """Iterate over the strings and interpolations in order."""
@@ -348,16 +388,18 @@ class SqlTemplate:
             yield i
         yield self.strings[-1]
 
-    def resolve(self) -> ResolvedSqlTemplate:
-        """Recursively resolve Interpolations into Params, returning a ResolvedSqlTemplate."""
-        return _resolve(self)
-
     def compile(self, *, paramstyle: ParamStyle = "dollar") -> CompiledSql:
         """Compile this template into a final SQL string with parameter placeholders, and the params."""
-        return self.resolve().compile(paramstyle=paramstyle)
+        parts = _resolve(self, self._site)
+        try:
+            return compile_parts(parts, paramstyle=paramstyle)
+        except Exception as e:
+            if self._site:
+                e.add_note(f"while compiling SqlTemplate created at {_format_site(self._site)}")
+            raise
 
     def __str__(self) -> Never:
-        msg = "SqlTemplate cannot be directly converted to a string, since it may contain unresolved interpolations. Please call .resolve() or .compile() first."  # noqa: E501
+        msg = "SqlTemplate cannot be directly converted to a string, since it may contain parameters. Please call .compile() first."  # noqa: E501
         raise NotImplementedError(msg)
 
     def __repr__(self) -> str:
@@ -365,44 +407,19 @@ class SqlTemplate:
         return f"SqlTemplate({', '.join(part_strings)})"
 
 
-class ResolvedSqlTemplate:
-    """A SqlTemplate that has been resolved to only strings and Params."""
+def _caller_site() -> tuple[str, int] | None:
+    """Return the (filename, lineno) of the nearest caller outside this module."""
+    frame: FrameType | None = sys._getframe(1)  # noqa: SLF001
+    while frame is not None and frame.f_globals.get("__name__") == __name__:
+        frame = frame.f_back
+    if frame is None:
+        return None
+    return frame.f_code.co_filename, frame.f_lineno
 
-    def __init__(self, parts: Iterable[str | Param]) -> None:
-        self.parts = tuple(parts)
 
-    def compile(self, *, paramstyle: ParamStyle = "dollar") -> CompiledSql:
-        """Compile this template into a final SQL string with parameter placeholders, and the params."""
-        return compile_parts(self.parts, paramstyle=paramstyle)
-
-    def __str__(self) -> Never:
-        msg = "ResolvedSqlTemplate cannot be directly converted to a string, since it may contain parameters. Please call .compile() first."  # noqa: E501
-        raise NotImplementedError(msg)
-
-    def __repr__(self) -> str:
-        part_strings = []
-        for part in self.parts:
-            if isinstance(part, str):
-                part_strings.append(repr(part))
-            else:
-                part_strings.append(f"{{{part.name}={part.value}}}")
-        return f"ResolvedSqlTemplate({', '.join(part_strings)})"
-
-    def __iter__(self) -> Iterator[str | Param]:
-        start = 0
-        end = len(self.parts)
-        while start < end and self.parts[start] == "":
-            start += 1
-        while end > start and self.parts[end - 1] == "":
-            end -= 1
-        yield from self.parts[start:end]
-
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, CompiledSql):
-            return self.compile() == other
-        if isinstance(other, ResolvedSqlTemplate):
-            return self.parts == other.parts
-        return False
+def _format_site(site: tuple[str, int]) -> str:
+    filename, lineno = site
+    return f"{filename}:{lineno}"
 
 
 T = TypeVar("T")

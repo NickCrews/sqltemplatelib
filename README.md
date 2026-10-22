@@ -33,14 +33,21 @@ sqlite3.connect(":memory:").execute(c.sql, c.params)
 ## Lifecycle
 
 ```
-anything ──template()──▶ SqlTemplate ──.resolve()──▶ ResolvedSqlTemplate ──.compile()──▶ CompiledSql
+anything ──template()──▶ SqlTemplate ──.compile(paramstyle)──▶ CompiledSql
 ```
 
-- `SqlTemplate`: strings and interpolations, as written.
-- `ResolvedSqlTemplate`: nested templates expanded; only SQL strings and `Param`s remain.
+- `SqlTemplate`: strings and interpolations, as written. Nested templates and `__sql_template__()` objects stay unexpanded.
 - `CompiledSql`: final `.sql` string and `.params` (dict for named styles, tuple for positional).
 
-You can stop at any stage to inspect or transform the template. `str()` on any of them raises, so parameters cannot be dropped by accident.
+`.compile()` expands interpolations, calling `__sql_template__()` at that point, so the SQL reflects each object's state at compile time. If expansion fails, the exception gets notes naming each interpolation and the file and line where each enclosing `SqlTemplate` was created:
+
+```
+KeyError: 'min_age'
+while expanding {filters} in SqlTemplate created at app.py:8
+while expanding {where} in SqlTemplate created at app.py:9
+```
+
+`str()` on either type raises, so parameters cannot be dropped by accident.
 
 ## What becomes what
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 from sqltemplatelib import (
@@ -9,7 +11,6 @@ from sqltemplatelib import (
     IntoInterpolation,
     Param,
     ParamInterpolation,
-    ResolvedSqlTemplate,
     SqlTemplate,
     SupportsSqlTemplate,
     compile,
@@ -515,15 +516,14 @@ class TestTemplateWithInterpolations:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# resolve / _resolve_interpolation
+# resolving interpolations at compile time
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-class TestResolve:
+class TestCompile:
     def test_plain_string_resolves_to_itself(self):
         t = SqlTemplate("SELECT 1")
-        resolved = t.resolve()
-        assert list(resolved) == ["SELECT 1"]
+        assert t.compile() == CompiledSql("SELECT 1")
 
     def test_conversion_s_resolves_to_string(self):
         interp = FakeInterpolation(value=42, expression="x", conversion="s")
@@ -535,7 +535,7 @@ class TestResolve:
     def test_conversion_r_resolves_to_repr(self):
         interp = FakeInterpolation(value="hello", expression="x", conversion="r")
         t = SqlTemplate("SELECT ", interp)
-        resolved = t.resolve()
+        resolved = t.compile()
         expected = CompiledSql("SELECT 'hello'")
         assert resolved == expected
 
@@ -549,7 +549,7 @@ class TestResolve:
         """A string value in an interpolation (no conversion) must become a param, not raw SQL."""
         interp = FakeInterpolation(value="DROP TABLE users", expression="val")
         t = SqlTemplate("SELECT ", interp)
-        resolved = t.resolve()
+        resolved = t.compile()
         expected = CompiledSql("SELECT $p0_val", params={"p0_val": "DROP TABLE users"})
         assert resolved == expected
 
@@ -557,7 +557,7 @@ class TestResolve:
         rel = SimpleRelation("SELECT 1")
         interp = FakeInterpolation(value=rel, expression="rel")
         t = SqlTemplate("SELECT * FROM (", interp, ")")
-        resolved = t.resolve()
+        resolved = t.compile()
         expected = CompiledSql("SELECT * FROM (SELECT 1)")
         assert resolved == expected
 
@@ -565,43 +565,9 @@ class TestResolve:
         """When interpolation resolves to a single param, the expression name should be kept."""
         interp = FakeInterpolation(value=42, expression="my_age")
         t = SqlTemplate("age = ", interp)
-        resolved = t.resolve()
+        resolved = t.compile()
         expected = CompiledSql("age = $p0_my_age", params={"p0_my_age": 42})
         assert resolved == expected
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ResolvedSqlTemplate
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-class TestResolvedSqlTemplate:
-    def test_basic(self):
-        r = ResolvedSqlTemplate(["SELECT ", param(42, "x")])
-        parts = list(r)
-        assert len(parts) == 2
-
-    def test_compile(self):
-        r = ResolvedSqlTemplate(["SELECT ", param(42, "x")])
-        compiled = r.compile()
-        assert isinstance(compiled, CompiledSql)
-        assert 42 in compiled.params.values()
-
-    def test_str_raises(self):
-        r = ResolvedSqlTemplate(["SELECT 1"])
-        with pytest.raises(NotImplementedError):
-            str(r)
-
-    def test_repr(self):
-        r = ResolvedSqlTemplate(["SELECT ", param(42, "x")])
-        rep = repr(r)
-        assert "ResolvedSqlTemplate" in rep
-        assert "x=42" in rep
-
-    def test_iter(self):
-        parts_in = ["a", param(1, "x"), "b"]
-        r = ResolvedSqlTemplate(parts_in)
-        assert list(r) == parts_in
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -688,7 +654,7 @@ class TestSupportsSqlTemplate:
         assert not isinstance("hello", SupportsSqlTemplate)
         assert not isinstance(42, SupportsSqlTemplate)
 
-    def test_template_calls_dunder(self):
+    def test_dunder_called_at_compile_not_template(self):
         class Tracking:
             def __init__(self) -> None:
                 self.called = False
@@ -698,8 +664,39 @@ class TestSupportsSqlTemplate:
                 return "SELECT 1"
 
         obj = Tracking()
-        template(obj)
+        t = template(obj)
+        assert not obj.called
+        t.compile()
         assert obj.called
+
+    def test_compile_reflects_state_at_compile_time(self):
+        class Table:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def __sql_template__(self, **kwargs) -> str:
+                return f"SELECT * FROM {self.name}"  # noqa: S608
+
+        table = Table("a")
+        t = template(table)
+        table.name = "b"
+        assert t.compile() == CompiledSql("SELECT * FROM b")
+
+    def test_dunder_returning_scalar_inside_interpolation_is_param(self):
+        class Wrapper:
+            def __sql_template__(self, **kwargs) -> int:
+                return 5
+
+        interp = FakeInterpolation(value=Wrapper(), expression="w")
+        assert compile("x = ", interp) == CompiledSql("x = $p0_w", {"p0_w": 5})
+
+    def test_dunder_returning_named_param_inside_interpolation_keeps_name(self):
+        class Wrapper:
+            def __sql_template__(self, **kwargs) -> Param:
+                return param(5, "five", exact=True)
+
+        interp = FakeInterpolation(value=Wrapper(), expression="w")
+        assert compile("x = ", interp) == CompiledSql("x = $five", {"five": 5})
 
     def test_future_kwargs_accepted(self):
         """Implementations should accept **kwargs for future extensibility."""
@@ -1022,3 +1019,52 @@ class TestConversionSemantics:
         actual = compile(interp)
         expected = CompiledSql("$p0_x", params={"p0_x": 3.14159})
         assert actual == expected
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Error notes pointing at where a template was created
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class Exploding:
+    def __sql_template__(self, **kwargs) -> str:
+        msg = "boom"
+        raise RuntimeError(msg)
+
+
+class TestErrorNotes:
+    def test_note_names_interpolation_and_creation_site(self):
+        interp = FakeInterpolation(value=Exploding(), expression="table")
+        t = SqlTemplate("SELECT * FROM ", interp)
+        line = sys._getframe().f_lineno - 1
+        with pytest.raises(RuntimeError, match="boom") as exc_info:
+            t.compile()
+        assert exc_info.value.__notes__ == [f"while expanding {{table}} in SqlTemplate created at {__file__}:{line}"]
+
+    def test_template_factory_records_caller_not_library(self):
+        t = template("SELECT * FROM ", Exploding())
+        line = sys._getframe().f_lineno - 1
+        with pytest.raises(RuntimeError) as exc_info:
+            t.compile()
+        assert exc_info.value.__notes__ == [
+            f"while expanding Exploding object in SqlTemplate created at {__file__}:{line}"
+        ]
+
+    def test_nested_templates_add_a_note_per_level(self):
+        inner = template("SELECT * FROM ", Exploding())
+        inner_line = sys._getframe().f_lineno - 1
+        outer = SqlTemplate("SELECT * FROM (", FakeInterpolation(value=inner, expression="inner"), ")")
+        outer_line = sys._getframe().f_lineno - 1
+        with pytest.raises(RuntimeError) as exc_info:
+            outer.compile()
+        assert exc_info.value.__notes__ == [
+            f"while expanding Exploding object in SqlTemplate created at {__file__}:{inner_line}",
+            f"while expanding {{inner}} in SqlTemplate created at {__file__}:{outer_line}",
+        ]
+
+    def test_compile_error_notes_creation_site(self):
+        t = template(param(1, "x", exact=True), param(2, "x", exact=True))
+        line = sys._getframe().f_lineno - 1
+        with pytest.raises(ValueError, match="Duplicate parameter names") as exc_info:
+            t.compile()
+        assert exc_info.value.__notes__ == [f"while compiling SqlTemplate created at {__file__}:{line}"]
