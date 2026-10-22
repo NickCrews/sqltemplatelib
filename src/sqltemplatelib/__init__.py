@@ -273,7 +273,7 @@ def compile(
     CompiledSql(sql='SELECT * FROM people WHERE age >= $p0_age', params={'p0_age': 18})
     >>> parts = ["SELECT * FROM people WHERE age >= ", age]
     >>> compile(parts, "duckdb")
-    CompiledSql(sql='SELECT * FROM people WHERE age >= $p0_age', params={'p0_age': 18})
+    CompiledSql(sql='SELECT * FROM people WHERE age >= $p0', params={'p0': 18})
     """
     return template(obj).compile(compiler)
 
