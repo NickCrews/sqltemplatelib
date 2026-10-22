@@ -7,10 +7,10 @@ import re
 import sys
 from collections import Counter
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Literal, Never, Protocol, TypeVar, runtime_checkable
+from typing import TYPE_CHECKING, ClassVar, Literal, Never, Protocol, TypeVar, get_args, runtime_checkable
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
     from types import FrameType
 
     from typing_extensions import TypeIs
@@ -18,13 +18,20 @@ if TYPE_CHECKING:
 __all__ = [
     "PARAMSTYLES",
     "CompiledSql",
+    "Compiler",
+    "DbApiCompiler",
     "IntoInterpolation",
     "Param",
     "ParamStyle",
     "SqlTemplate",
     "SupportsSqlTemplate",
     "compile",
+    "compile_parts",
+    "get_compiler",
+    "is_compiled_sql",
+    "is_sql_param",
     "param",
+    "register_compiler",
     "template",
 ]
 
@@ -44,7 +51,7 @@ ParamStyle = Literal["dollar", "named", "pyformat", "qmark", "format", "numeric"
 For `pyformat` and `format`, literal `%` characters in the SQL are escaped as `%%`.
 """
 
-PARAMSTYLES: tuple[ParamStyle, ...] = ("dollar", "named", "pyformat", "qmark", "format", "numeric", "dollar_numeric")
+PARAMSTYLES: tuple[ParamStyle, ...] = get_args(ParamStyle)
 
 _NAMED_STYLES = frozenset({"dollar", "named", "pyformat"})
 _PARAM_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -63,9 +70,13 @@ class CompiledSql:
     >>> age = 37
     >>> compile(t"SELECT * FROM users WHERE age >= {age}")
     CompiledSql(sql='SELECT * FROM users WHERE age >= $p0_age', params={'p0_age': 37})
-    >>> compile(t"SELECT * FROM users WHERE age >= {age}", paramstyle="qmark")
+    >>> compile(t"SELECT * FROM users WHERE age >= {age}", compiler="sqlite3")
     CompiledSql(sql='SELECT * FROM users WHERE age >= ?', params=(37,))
+
+    `__sql_compiled__` marks this as compiled SQL as defined in SPEC.md, so it cannot be embedded in a template.
     """
+
+    __sql_compiled__: ClassVar[bool] = True
 
     sql: str
     params: dict[str, object] | tuple[object, ...] = dataclasses.field(default_factory=dict)
@@ -74,6 +85,24 @@ class CompiledSql:
         """Disallow accidentally converting to a string, since that would lose the parameters."""
         msg = "CompiledSql cannot be directly converted to a string, since it may contain parameters. Please use the .sql attribute for the SQL string, and the .params attribute for the parameters."  # noqa: E501
         raise NotImplementedError(msg)
+
+
+def is_compiled_sql(obj: object) -> bool:
+    """Return whether obj is compiled SQL as defined in SPEC.md: SQL text whose placeholders are already rendered.
+
+    obj is compiled SQL if its type has a truthy `__sql_compiled__` attribute.
+    Having `sql` and `params` attributes is not enough, so mocks and objects with a catch-all `__getattr__`
+    are still bound as ordinary values.
+
+    Compiled SQL cannot be embedded in a template, since its placeholders are in one driver's syntax
+    and its param names may collide with the enclosing template's.
+
+    >>> is_compiled_sql(CompiledSql("SELECT 1"))
+    True
+    >>> is_compiled_sql(template("SELECT 1"))
+    False
+    """
+    return bool(getattr(type(obj), "__sql_compiled__", False))
 
 
 @runtime_checkable
@@ -106,7 +135,12 @@ class Param:
     - `name="age", exact=True`: the name is used as-is, eg `age`.
 
     Names are ignored for positional paramstyles.
+
+    `__sql_param__` marks this as a parameter object as defined in SPEC.md.
+    Any object with that marker and `value`, `name`, and `exact` attributes is treated the same way.
     """
+
+    __sql_param__: ClassVar[bool] = True
 
     value: object
     name: str | None = None
@@ -126,6 +160,33 @@ def param(value: object, name: str | None = None, *, exact: bool = False) -> Par
     return Param(value=value, name=name, exact=exact)
 
 
+def is_sql_param(obj: object) -> bool:
+    """Return whether obj is a parameter object as defined in SPEC.md: its type has a truthy `__sql_param__`.
+
+    The marker is read from the type, not the instance, like Python's own dunder lookups.
+    So a class that is itself a parameter type, eg `Param`, is not a parameter object when used as a value,
+    and an object whose `__getattr__` answers any name is not one by accident.
+
+    >>> is_sql_param(param(1))
+    True
+    >>> is_sql_param(Param)
+    False
+    """
+    return bool(getattr(type(obj), "__sql_param__", False))
+
+
+def _as_param(obj: object) -> Param | None:
+    """Return obj as a Param if it is a parameter object as defined in SPEC.md, else None."""
+    if isinstance(obj, Param):
+        return obj
+    if not is_sql_param(obj):
+        return None
+    if not hasattr(obj, "value"):
+        msg = f"{type(obj).__name__} sets __sql_param__ but has no `value` attribute, which a parameter object needs."
+        raise TypeError(msg)
+    return Param(obj.value, getattr(obj, "name", None), exact=getattr(obj, "exact", False))
+
+
 def template(*parts: str | IntoInterpolation | Param | SupportsSqlTemplate | object) -> SqlTemplate:
     """Convert a sequence of things into a SqlTemplate.
 
@@ -136,6 +197,7 @@ def template(*parts: str | IntoInterpolation | Param | SupportsSqlTemplate | obj
     - If the thing is a `str`, treat it as raw SQL.
     - If it's an Interpolation, leave it as is, treating it as an interpolation.
     - If it's a Param, wrap it in an Interpolation.
+    - If it's compiled SQL (see is_compiled_sql()), raise TypeError.
     - If it's another iterable, expand each item.
     - Otherwise, treat the thing as a param, and then wrap the Param in an Interpolation.
 
@@ -196,15 +258,14 @@ def template(*parts: str | IntoInterpolation | Param | SupportsSqlTemplate | obj
 
 def compile(
     *parts: str | IntoInterpolation | Param | SupportsSqlTemplate | object,
-    paramstyle: ParamStyle = "dollar",
+    compiler: str | Compiler = "duckdb",
 ) -> CompiledSql:
     """Compile a sequence of things into a final SQL string with parameter placeholders, and the params.
 
     This is a convenience function that combines template() and .compile() into one step.
-
-    For more details and examples, see template().
+    See SqlTemplate.compile() for `compiler`, and template() for more examples.
     """
-    return template(*parts).compile(paramstyle=paramstyle)
+    return template(*parts).compile(compiler)
 
 
 def _is_iterable_nonstring(value: object) -> TypeIs[Iterable[object]]:
@@ -218,8 +279,14 @@ def _expand_part(part: object) -> Iterable[str | IntoInterpolation]:
         yield part
     elif isinstance(part, IntoInterpolation):
         yield part
-    elif isinstance(part, Param):
-        yield ParamInterpolation(part)
+    elif (p := _as_param(part)) is not None:
+        yield ParamInterpolation(p)
+    elif is_compiled_sql(part):
+        msg = (
+            f"Cannot embed compiled SQL ({type(part).__name__}) in a template, since its placeholders are already"
+            " rendered. Pass the template it was compiled from, or wrap it in param() to bind it as a value."
+        )
+        raise TypeError(msg)
     elif _is_iterable_nonstring(part):
         for item in part:
             yield from _expand_part(item)
@@ -279,7 +346,7 @@ def _resolve(parts: Iterable[str | IntoInterpolation], site: tuple[str, int] | N
             resolved.extend(_resolve_interpolation(part))
         except Exception as e:
             what = f"{{{part.expression}}}" if part.expression else f"{type(part.value).__name__} object"
-            where = f" in SqlTemplate created at {_format_site(site)}" if site else ""
+            where = f" in {_site_suffix(site)}" if site else ""
             e.add_note(f"while expanding {what}{where}")
             raise
     return resolved
@@ -287,14 +354,14 @@ def _resolve(parts: Iterable[str | IntoInterpolation], site: tuple[str, int] | N
 
 def _resolve_interpolation(interp: IntoInterpolation) -> Iterable[str | Param]:
     value = interp.value
-    if isinstance(value, Param):
+    if (as_param := _as_param(value)) is not None:
         # A Param passed directly to template() keeps its own settings.
         # A named Param written inside a t-string keeps its name exactly.
         if isinstance(interp, ParamInterpolation):
-            return (value,)
-        if value.name is None:
-            return (param(value.value),)
-        return (param(value.value, name=value.name, exact=True),)
+            return (as_param,)
+        if as_param.name is None:
+            return (param(as_param.value),)
+        return (param(as_param.value, name=as_param.name, exact=True),)
 
     # A conversion (!s, !r, !a) means "insert as raw SQL, not as a param".
     # This is for things that cannot be params, such as identifiers or SQL keywords.
@@ -388,14 +455,43 @@ class SqlTemplate:
             yield i
         yield self.strings[-1]
 
-    def compile(self, *, paramstyle: ParamStyle = "dollar") -> CompiledSql:
-        """Compile this template into a final SQL string with parameter placeholders, and the params."""
-        parts = _resolve(self, self._site)
+    def __sql_template__(self, /, **future_kwargs: object) -> tuple[str | IntoInterpolation, ...]:
+        """Return the strings and interpolations, so a SqlTemplate is composable like any other object."""
+        return tuple(self)
+
+    def resolve(self) -> list[str | Param]:
+        """Expand all interpolations, recursively, into a flat list of SQL text and Params.
+
+        This is the expansion described in SPEC.md, and the entry point for consumers:
+        a library that executes SQL resolves a template and renders each Param in its own placeholder syntax,
+        eg with compile_parts(). Calls `__sql_template__()` on any objects that implement it.
+
+        >>> template("SELECT * FROM people WHERE age >= ", param(18, "age")).resolve()
+        ['SELECT * FROM people WHERE age >= ', Param(value=18, name='age', exact=False), '']
+        """
+        return _resolve(self, self._site)
+
+    def compile(self, compiler: str | Compiler = "duckdb") -> CompiledSql:
+        """Compile this template into a final SQL string with parameter placeholders, and the params.
+
+        `compiler` is a Compiler, or the name of one in the registry: a driver name or a paramstyle.
+        See get_compiler().
+
+        >>> t = template("SELECT * FROM people WHERE age >= ", param(18, "age"))
+        >>> t.compile()
+        CompiledSql(sql='SELECT * FROM people WHERE age >= $p0_age', params={'p0_age': 18})
+        >>> t.compile("asyncpg")
+        CompiledSql(sql='SELECT * FROM people WHERE age >= $1', params=(18,))
+        >>> t.compile("format")
+        CompiledSql(sql='SELECT * FROM people WHERE age >= %s', params=(18,))
+        """
+        compiler = get_compiler(compiler)
         try:
-            return compile_parts(parts, paramstyle=paramstyle)
+            return compiler.__sql_compile__(self)
         except Exception as e:
-            if self._site:
-                e.add_note(f"while compiling SqlTemplate created at {_format_site(self._site)}")
+            # Errors from expanding interpolations already carry a note naming this site.
+            if self._site and not any(note.endswith(_site_suffix(self._site)) for note in getattr(e, "__notes__", ())):
+                e.add_note(f"while compiling {_site_suffix(self._site)}")
             raise
 
     def __str__(self) -> Never:
@@ -417,9 +513,13 @@ def _caller_site() -> tuple[str, int] | None:
     return frame.f_code.co_filename, frame.f_lineno
 
 
-def _format_site(site: tuple[str, int]) -> str:
+def _site_suffix(site: tuple[str, int]) -> str:
+    """Return the end of an error note naming where a template was created.
+
+    Every note about a template ends with this, so SqlTemplate.compile() can tell whether one is already there.
+    """
     filename, lineno = site
-    return f"{filename}:{lineno}"
+    return f"SqlTemplate created at {filename}:{lineno}"
 
 
 T = TypeVar("T")
@@ -452,28 +552,42 @@ def parse_parts(parts: Iterable[str | T]) -> tuple[tuple[str, ...], tuple[T, ...
     return tuple(strings), tuple(others)
 
 
-def _placeholder(paramstyle: ParamStyle, name: str, position: int) -> str:
-    if paramstyle == "dollar":
-        return f"${name}"
-    if paramstyle == "named":
-        return f":{name}"
-    if paramstyle == "pyformat":
-        return f"%({name})s"
-    if paramstyle == "qmark":
-        return "?"
-    if paramstyle == "format":
-        return "%s"
-    if paramstyle == "numeric":
-        return f":{position}"
-    return f"${position}"
+@runtime_checkable
+class Compiler(Protocol):
+    """Turns a SqlTemplate into a CompiledSql for a particular database and driver.
+
+    The compiler decides how the SQL is rendered: which placeholder syntax params use,
+    and whether params are a dict or a tuple.
+    Implementations typically call `template.resolve()` and render the resulting SQL text and Params.
+
+    A compiler opts in by defining `__sql_compile__`, so a plain function or other callable is not one by accident.
+    """
+
+    def __sql_compile__(self, template: SqlTemplate, /) -> CompiledSql:
+        """Compile template into a final SQL string with parameter placeholders, and the params."""
 
 
-def compile_parts(parts: Iterable[str | Param], /, *, paramstyle: ParamStyle = "dollar") -> CompiledSql:
-    """Compile parts into a final SQL string with parameter placeholders, and the params."""
-    if paramstyle not in PARAMSTYLES:
-        msg = f"Unknown paramstyle: {paramstyle!r}. Expected one of {PARAMSTYLES}."
-        raise ValueError(msg)
-    escape_percent = paramstyle in ("pyformat", "format")
+def compile_parts(
+    parts: Iterable[str | Param],
+    /,
+    *,
+    placeholder: Callable[[str, int], str],
+    named: bool,
+    escape_percent: bool = False,
+) -> CompiledSql:
+    """Compile resolved parts, as from `SqlTemplate.resolve()`, into a CompiledSql.
+
+    This does the work shared by all compilers: naming params, checking names, and collecting values.
+    The caller decides the rendering:
+
+    - `placeholder(name, position)` returns the SQL text for a param, given its name and 1-based position.
+    - `named=True` returns params as a dict keyed by name, and raises ValueError on duplicate names.
+      `named=False` returns them as a tuple in order.
+    - `escape_percent=True` escapes literal `%` in the SQL text as `%%`, for drivers that use `%` placeholders.
+
+    >>> compile_parts(["SELECT ", param(1, "x")], placeholder=lambda name, position: f"@{name}", named=True)
+    CompiledSql(sql='SELECT @p0_x', params={'p0_x': 1})
+    """
     sql_parts: list[str] = []
     params_items: list[tuple[str, object]] = []
 
@@ -495,10 +609,10 @@ def compile_parts(parts: Iterable[str | Param], /, *, paramstyle: ParamStyle = "
             else:
                 param_name = next_name(_sanitize_name_suffix(part.name))
             assert_param_name_legal(param_name)
-            sql_parts.append(_placeholder(paramstyle, param_name, len(params_items) + 1))
+            sql_parts.append(placeholder(param_name, len(params_items) + 1))
             params_items.append((param_name, part.value))
     sql = "".join(sql_parts)
-    if paramstyle not in _NAMED_STYLES:
+    if not named:
         return CompiledSql(sql=sql, params=tuple(value for _, value in params_items))
     param_name_counts = Counter(name for name, _ in params_items)
     dupes = [name for name, count in param_name_counts.items() if count > 1]
@@ -506,3 +620,100 @@ def compile_parts(parts: Iterable[str | Param], /, *, paramstyle: ParamStyle = "
         msg = f"Duplicate parameter names found: {dupes}. Please ensure all parameter names are unique."
         raise ValueError(msg)
     return CompiledSql(sql=sql, params=dict(params_items))
+
+
+_PLACEHOLDERS: dict[ParamStyle, Callable[[str, int], str]] = {
+    "dollar": lambda name, _position: f"${name}",
+    "named": lambda name, _position: f":{name}",
+    "pyformat": lambda name, _position: f"%({name})s",
+    "qmark": lambda _name, _position: "?",
+    "format": lambda _name, _position: "%s",
+    "numeric": lambda _name, position: f":{position}",
+    "dollar_numeric": lambda _name, position: f"${position}",
+}
+
+
+@dataclasses.dataclass(frozen=True)
+class DbApiCompiler:
+    """Compiles to a PEP 249 paramstyle, with no database-specific behavior.
+
+    >>> template("SELECT ", param(1)).compile(DbApiCompiler(paramstyle="numeric"))
+    CompiledSql(sql='SELECT :1', params=(1,))
+    """
+
+    paramstyle: ParamStyle
+
+    def __post_init__(self) -> None:
+        """Ensure paramstyle is known."""
+        if self.paramstyle not in PARAMSTYLES:
+            msg = f"Unknown paramstyle: {self.paramstyle!r}. Expected one of {PARAMSTYLES}."
+            raise ValueError(msg)
+
+    def __sql_compile__(self, template: SqlTemplate, /) -> CompiledSql:
+        """Compile template into a final SQL string with parameter placeholders, and the params."""
+        return compile_parts(
+            template.resolve(),
+            placeholder=_PLACEHOLDERS[self.paramstyle],
+            named=self.paramstyle in _NAMED_STYLES,
+            escape_percent=self.paramstyle in ("pyformat", "format"),
+        )
+
+
+# Keyed by the driver's import name, which is what appears in the caller's code, eg `mysql.connector`, not its
+# PyPI name `mysql-connector-python`. Each uses the driver's own `paramstyle`, except duckdb, which declares
+# `qmark` but also accepts `$name`; `dollar` keeps param names visible in the SQL.
+_COMPILERS: dict[str, Compiler] = {
+    "duckdb": DbApiCompiler("dollar"),
+    "sqlite3": DbApiCompiler("qmark"),
+    "psycopg": DbApiCompiler("pyformat"),
+    "psycopg2": DbApiCompiler("pyformat"),
+    "pg8000": DbApiCompiler("format"),
+    "asyncpg": DbApiCompiler("dollar_numeric"),
+    "pymysql": DbApiCompiler("pyformat"),
+    "MySQLdb": DbApiCompiler("format"),
+    "mysql.connector": DbApiCompiler("pyformat"),
+    "oracledb": DbApiCompiler("named"),
+    # Paramstyle names, for drivers not listed above or to pick a driver's non-default style.
+    **{paramstyle: DbApiCompiler(paramstyle) for paramstyle in PARAMSTYLES},
+}
+
+
+def register_compiler(name: str, compiler: Compiler, *, overwrite: bool = False) -> None:
+    """Register a compiler under a name, so that `.compile(name)` uses it.
+
+    The registry is shared by everything in the process, so be polite:
+    register only names you own, such as your own package or driver name.
+
+    Raises ValueError if the name is already registered, unless overwrite=True.
+
+    >>> register_compiler("myapp.sqlite3_named", DbApiCompiler("named"))
+    >>> compile("SELECT ", param(1, "x"), compiler="myapp.sqlite3_named")
+    CompiledSql(sql='SELECT :p0_x', params={'p0_x': 1})
+    """
+    if not isinstance(compiler, Compiler):
+        msg = f"Expected a Compiler, got {type(compiler).__name__}."
+        raise TypeError(msg)
+    if name in _COMPILERS and not overwrite:
+        msg = f"A compiler is already registered as {name!r}. Pass overwrite=True to replace it."
+        raise ValueError(msg)
+    _COMPILERS[name] = compiler
+
+
+def get_compiler(compiler: str | Compiler, /) -> Compiler:
+    """Look up a compiler by name in the registry. A Compiler is returned as is.
+
+    The built-in names are:
+    - driver import names: duckdb, sqlite3, psycopg, psycopg2, pg8000, asyncpg,
+      pymysql, MySQLdb, mysql.connector, and oracledb. See the README for the paramstyle each uses.
+    - paramstyle names, eg `qmark`, each giving `DbApiCompiler(paramstyle)`.
+    """
+    if isinstance(compiler, Compiler):
+        return compiler
+    if not isinstance(compiler, str):
+        msg = f"Expected a compiler name or a Compiler, got {type(compiler).__name__}."
+        raise TypeError(msg)
+    try:
+        return _COMPILERS[compiler]
+    except KeyError:
+        msg = f"Unknown compiler: {compiler!r}. Registered compilers are {sorted(_COMPILERS)}."
+        raise ValueError(msg) from None

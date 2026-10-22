@@ -5,7 +5,7 @@ Composable, injection-safe SQL templates built on Python [t-strings](https://doc
 - Interpolated values become bound parameters, not SQL text.
 - Templates nest, so subqueries and reusable fragments compose.
 - Any object can take part by implementing `__sql_template__()`. Libraries can implement it without depending on this package.
-- Compiles to any DB-API paramstyle: DuckDB, sqlite3, psycopg, asyncpg, and others.
+- Compiles for common drivers by name (duckdb, sqlite3, psycopg, asyncpg, pymysql, ...), any DB-API paramstyle, or a compiler you write.
 - Pure Python, zero runtime dependencies, Python 3.11+. t-string syntax needs 3.14; on older versions, build templates with `template(...)`.
 
 Status: pre-alpha. The API is extracted from [duckdb/duckdb-python#409](https://github.com/duckdb/duckdb-python/pull/409) and may change.
@@ -19,27 +19,25 @@ from sqltemplatelib import template
 min_age = 18
 adults = template(t"SELECT * FROM people WHERE age >= {min_age}")
 
-name = "x'; DROP TABLE people; --"
+name = "x'; DROP TABLE people; -- Evil Hacker"
 query = template(t"SELECT name FROM ({adults}) WHERE name != {name}")
 
-query.compile()
-# CompiledSql(sql='SELECT name FROM (SELECT * FROM people WHERE age >= $p0_min_age) WHERE name != $p1_name',
-#             params={'p0_min_age': 18, 'p1_name': "x'; DROP TABLE people; --"})
-
-c = query.compile(paramstyle="qmark")
+c = query.compile("sqlite3")
+# CompiledSql(sql='SELECT name FROM (SELECT * FROM people WHERE age >= ?) WHERE name != ?',
+#             params=(18, "x'; DROP TABLE people; -- Evil Hacker"))
 sqlite3.connect(":memory:").execute(c.sql, c.params)
 ```
 
 ## Lifecycle
 
 ```
-anything ──template()──▶ SqlTemplate ──.compile(paramstyle)──▶ CompiledSql
+anything ──template()──▶ SqlTemplate ──.compile(compiler)──▶ CompiledSql
 ```
 
 - `SqlTemplate`: strings and interpolations, as written. Nested templates and `__sql_template__()` objects stay unexpanded.
 - `CompiledSql`: final `.sql` string and `.params` (dict for named styles, tuple for positional).
 
-`.compile()` expands interpolations, calling `__sql_template__()` at that point, so the SQL reflects each object's state at compile time. If expansion fails, the exception gets notes naming each interpolation and the file and line where each enclosing `SqlTemplate` was created:
+`compile()` expands interpolations, calling `__sql_template__()` at that point, so the SQL reflects each object's state at compile time. If expansion fails, the exception gets notes naming each interpolation and the file and line where each enclosing `SqlTemplate` was created:
 
 ```
 KeyError: 'min_age'
@@ -51,7 +49,7 @@ while expanding {where} in SqlTemplate created at app.py:9
 
 ## What becomes what
 
-Inside a t-string, an interpolation `{x}` is handled as follows:
+Inside a t-string like t'SELECT * FROM table WHERE {x}', the interpolation `{x}` is handled as follows:
 
 | `x` is...                                  | result                                                |
 |--------------------------------------------|-------------------------------------------------------|
@@ -79,20 +77,6 @@ param(42, "age", exact=True)  # $age      (name used as-is)
 ```
 
 Generated names are numbered by position, so the same expression used twice gets two distinct params. Expressions that are not identifiers are sanitized, eg `{user.age}` becomes `$p0_user_age`. Exact names must match `[A-Za-z_][A-Za-z0-9_]*`. Duplicate names raise `ValueError` in named paramstyles.
-
-## Paramstyles
-
-| `paramstyle`       | placeholder | params | used by                        |
-|--------------------|-------------|--------|--------------------------------|
-| `dollar` (default) | `$name`     | dict   | DuckDB                         |
-| `named`            | `:name`     | dict   | sqlite3, oracledb, SQLAlchemy  |
-| `pyformat`         | `%(name)s`  | dict   | psycopg, pymysql               |
-| `qmark`            | `?`         | tuple  | sqlite3, DuckDB                |
-| `format`           | `%s`        | tuple  | psycopg, pymysql               |
-| `numeric`          | `:1`        | tuple  | PEP 249                        |
-| `dollar_numeric`   | `$1`        | tuple  | asyncpg, DuckDB                |
-
-For `pyformat` and `format`, literal `%` in the SQL is escaped as `%%`.
 
 ## Making your objects composable
 
@@ -126,7 +110,91 @@ template(t"SELECT * FROM users WHERE {filters}").compile()
 
 `**kwargs` is reserved for future options. Implementations must accept it and may ignore it.
 
-The protocol is duck-typed: a library such as a dataframe or query-builder package can implement `__sql_template__` on its own types without importing `sqltemplatelib`. See [SPEC.md](SPEC.md).
+The protocol is duck-typed: a library such as a dataframe or query-builder package can implement `__sql_template__` on its own types without importing `sqltemplatelib`. To return a parameter with an explicit name without importing `Param`, use any object whose type has `__sql_param__ = True` and that has `value`, `name`, and `exact` attributes. See [SPEC.md](SPEC.md).
+
+## Compilers
+
+A compiler turns a `SqlTemplate` into a `CompiledSql` for a particular driver. Pass `.compile()` a driver name, a paramstyle, or a compiler:
+
+```python
+from sqltemplatelib import DbApiCompiler, param, template
+
+t = template("SELECT * FROM people WHERE age >= ", param(18, "age"))
+t.compile()  # same as t.compile("duckdb")
+t.compile("asyncpg")  # CompiledSql(sql='SELECT * FROM people WHERE age >= $1', params=(18,))
+t.compile("format")  # ... age >= %s', params=(18,))
+t.compile(DbApiCompiler("format"))  # same as above
+```
+
+Drivers are named by their import name, since that is what appears in your code and stdlib `sqlite3` has no PyPI name. Each uses the driver's own `paramstyle`, except `duckdb`, which declares `qmark` but also accepts `$name`.
+
+| name               | paramstyle       | placeholder | params |
+|--------------------|------------------|-------------|--------|
+| `duckdb` (default) | `dollar`         | `$name`     | dict   |
+| `sqlite3`          | `qmark`          | `?`         | tuple  |
+| `psycopg`          | `pyformat`       | `%(name)s`  | dict   |
+| `psycopg2`         | `pyformat`       | `%(name)s`  | dict   |
+| `pg8000`           | `format`         | `%s`        | tuple  |
+| `asyncpg`          | `dollar_numeric` | `$1`        | tuple  |
+| `pymysql`          | `pyformat`       | `%(name)s`  | dict   |
+| `MySQLdb`          | `format`         | `%s`        | tuple  |
+| `mysql.connector`  | `pyformat`       | `%(name)s`  | dict   |
+| `oracledb`         | `named`          | `:name`     | dict   |
+
+Most drivers accept more than one paramstyle. To use another, pass its name:
+
+| `paramstyle`       | placeholder | params |
+|--------------------|-------------|--------|
+| `dollar`           | `$name`     | dict   |
+| `named`            | `:name`     | dict   |
+| `pyformat`         | `%(name)s`  | dict   |
+| `qmark`            | `?`         | tuple  |
+| `format`           | `%s`        | tuple  |
+| `numeric`          | `:1`        | tuple  |
+| `dollar_numeric`   | `$1`        | tuple  |
+
+For `pyformat` and `format`, literal `%` in the SQL is escaped as `%%`.
+
+### Custom compilers
+
+Any object with a `__sql_compile__(template: SqlTemplate) -> CompiledSql` method satisfies the `Compiler` protocol. `template.resolve()` expands every interpolation into a flat list of SQL text and `Param`s. Most compilers pass that to the util function `compile_parts()`, which names the params and collects their values, and pass it hooks for the rendering:
+
+```python
+from sqltemplatelib import CompiledSql, SqlTemplate, compile_parts, param, template
+
+
+class SqlServerCompiler:
+    def __sql_compile__(self, template: SqlTemplate) -> CompiledSql:
+        return compile_parts(template.resolve(), placeholder=lambda name, _position: f"@{name}", named=True)
+
+
+template("SELECT * FROM people WHERE age >= ", param(18, "age")).compile(SqlServerCompiler())
+# CompiledSql(sql='SELECT * FROM people WHERE age >= @p0_age', params={'p0_age': 18})
+```
+
+`register_compiler(name, compiler)` makes a compiler available by name. The registry is shared by the whole process, so register only names you own, such as your package or driver name. Registering an existing name raises unless you pass `overwrite=True`.
+
+## Accepting templates in a database library
+
+A library that executes SQL should accept any template or composable object, expand it, and render the params in its own syntax.
+
+```python
+from sqltemplatelib import SupportsSqlTemplate, is_compiled_sql, template
+from my_sql_server_compiler import SqlServerCompiler
+
+
+def execute(self, query, params=None):
+    if params is not None:
+        query, params = query, params
+    elif is_compiled_sql(query) and not isinstance(query, SupportsSqlTemplate):
+        query, params = query.sql, query.params
+    else:
+        compiled = template(query).compile(SqlServerCompiler())
+        query, params = compiled.sql, compiled.params
+    ...
+```
+
+A library that does not want the dependency on `sqltemplatelib` can implement the expansion rules in [SPEC.md](SPEC.md) itself.
 
 ## Prior art
 
@@ -138,8 +206,8 @@ This package focuses on the part those don't share: a common protocol so objects
 
 ## Open questions
 
-- Identifiers and literals. `!s` inserts raw text. psycopg uses `:i` / `:l` format specs that quote correctly. Quoting is dialect-specific, so supporting it needs a dialect hook alongside `paramstyle`.
-- Default paramstyle. `dollar` comes from DuckDB. A neutral library could instead require it.
+- Identifiers and literals. `!s` inserts raw text. psycopg uses `:i` / `:l` format specs that quote correctly. Quoting is dialect-specific, so it would need per-database compilers that call `compile_parts()` with their own hooks.
+- Default compiler. `duckdb` is the default because the API comes from DuckDB. A neutral library could instead require one.
 - A `join()` helper for building lists of fragments.
 
 ## Development

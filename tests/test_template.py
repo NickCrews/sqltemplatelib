@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import dataclasses
 import sys
+from unittest.mock import MagicMock, Mock
 
 import pytest
 
@@ -15,6 +17,8 @@ from sqltemplatelib import (
     SupportsSqlTemplate,
     compile,
     compile_parts,
+    is_compiled_sql,
+    is_sql_param,
     param,
     parse_parts,
     template,
@@ -455,6 +459,11 @@ class TestTemplateWithInterpolations:
         expected = CompiledSql("SELECT " + Cafe.ascii())
         assert expected == compiled
 
+    def test_conversion_ignored_for_param(self):
+        """A Param is bound even with !s, so a conversion cannot turn it into raw SQL."""
+        interp = FakeInterpolation(value=param(5, "x"), expression="p", conversion="s")
+        assert compile("SELECT ", interp) == CompiledSql("SELECT $x", {"x": 5})
+
     def test_string_value_becomes_param_not_raw_sql(self):
         """A string interpolation WITHOUT conversion should be a param, not raw SQL."""
         interp = FakeInterpolation(value="Alice", expression="name")
@@ -575,43 +584,47 @@ class TestCompile:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+def dollar_compile_parts(parts):
+    return compile_parts(parts, placeholder=lambda name, _position: f"${name}", named=True)
+
+
 class TestCompileParts:
     def test_all_strings(self):
-        result = compile_parts(["SELECT 1"])
+        result = dollar_compile_parts(["SELECT 1"])
         assert result == CompiledSql("SELECT 1")
 
     def test_single_unnamed_param(self):
-        result = compile_parts(["SELECT ", param(42)])
+        result = dollar_compile_parts(["SELECT ", param(42)])
         expected = CompiledSql("SELECT $p0", params={"p0": 42})
         assert result == expected
 
     def test_single_named_param(self):
-        result = compile_parts(["SELECT ", param(42, "x")])
+        result = dollar_compile_parts(["SELECT ", param(42, "x")])
         expected = CompiledSql("SELECT $p0_x", params={"p0_x": 42})
         assert result == expected
 
     def test_exact_param_uses_literal_name(self):
-        result = compile_parts(["SELECT ", param(42, "my_param", exact=True)])
+        result = dollar_compile_parts(["SELECT ", param(42, "my_param", exact=True)])
         expected = CompiledSql("SELECT $my_param", params={"my_param": 42})
         assert result == expected
 
     def test_multiple_params_numbered_sequentially(self):
-        result = compile_parts(["SELECT * WHERE a = ", param(1, "a"), " AND b = ", param(2, "b")])
+        result = dollar_compile_parts(["SELECT * WHERE a = ", param(1, "a"), " AND b = ", param(2, "b")])
         expected = CompiledSql("SELECT * WHERE a = $p0_a AND b = $p1_b", params={"p0_a": 1, "p1_b": 2})
         assert result == expected
 
     def test_duplicate_param_names_raises(self):
         with pytest.raises(ValueError, match="Duplicate parameter names"):
-            compile_parts([param(1, "x", exact=True), param(2, "x", exact=True)])
+            dollar_compile_parts([param(1, "x", exact=True), param(2, "x", exact=True)])
 
     def test_unnamed_params_get_sequential_names(self):
-        result = compile_parts(["a = ", param(1), " AND b = ", param(2)])
+        result = dollar_compile_parts(["a = ", param(1), " AND b = ", param(2)])
         expected = CompiledSql("a = $p0 AND b = $p1", params={"p0": 1, "p1": 2})
         assert result == expected
 
     def test_exact_param_causes_counter_gap(self):
         """Known issue: exact params still increment the counter, causing non-sequential auto names."""
-        result = compile_parts(
+        result = dollar_compile_parts(
             [
                 "a = ",
                 param(1, "x"),  # → p0_x
@@ -625,17 +638,17 @@ class TestCompileParts:
         assert result == expected
 
     def test_empty_parts(self):
-        result = compile_parts([])
+        result = dollar_compile_parts([])
         expected = CompiledSql("")
         assert result == expected
 
     def test_adjacent_strings(self):
-        result = compile_parts(["SELECT ", "1"])
+        result = dollar_compile_parts(["SELECT ", "1"])
         expected = CompiledSql("SELECT 1")
         assert result == expected
 
     def test_param_with_none_value(self):
-        result = compile_parts(["SELECT ", param(None, "x")])
+        result = dollar_compile_parts(["SELECT ", param(None, "x")])
         expected = CompiledSql("SELECT $p0_x", params={"p0_x": None})
         assert result == expected
 
@@ -797,6 +810,130 @@ class TestCompiledSql:
         c = CompiledSql("SELECT 1")
         with pytest.raises(NotImplementedError):
             str(c)
+
+
+@dataclasses.dataclass
+class SavedReport:
+    """A row from an app's saved_reports table.
+
+    It has `sql` and `params` fields, but it is an ordinary value that can be bound as a param,
+    eg via a psycopg dumper that adapts it to JSON.
+    """
+
+    name: str
+    sql: str
+    params: dict[str, object]
+
+
+def sales_report() -> SavedReport:
+    return SavedReport("weekly sales", "SELECT * FROM sales WHERE week = $week", {"week": 12})
+
+
+@dataclasses.dataclass(frozen=True)
+class BuiltQuery:
+    """Compiled SQL from a query builder that does not import sqltemplatelib."""
+
+    __sql_compiled__ = True  # No annotation, so a class attribute rather than a dataclass field.
+
+    sql: str
+    params: tuple[object, ...] = ()
+
+
+class TestIsCompiledSql:
+    def test_compiled_sql(self):
+        assert is_compiled_sql(CompiledSql("SELECT 1"))
+
+    def test_foreign_compiled(self):
+        assert is_compiled_sql(BuiltQuery("SELECT * FROM users WHERE id = ?", (7,)))
+
+    def test_dataclass_with_sql_and_params_fields(self):
+        assert not is_compiled_sql(sales_report())
+
+    @pytest.mark.parametrize("mock", [Mock(), MagicMock(), MagicMock(spec=sales_report())])
+    def test_mock(self, mock):
+        """Mocks answer every attribute, including `sql` and `params`."""
+        assert not is_compiled_sql(mock)
+
+    def test_instance_attribute_is_ignored(self):
+        report = sales_report()
+        report.__sql_compiled__ = True
+        assert not is_compiled_sql(report)
+
+    @pytest.mark.parametrize(
+        ("marker", "expected"), [(True, True), (1, True), ("yes", True), (False, False), (0, False), (None, False)]
+    )
+    def test_marker_truthiness_decides(self, marker, expected):
+        class MarkedReport(SavedReport):
+            __sql_compiled__ = marker
+
+        assert is_compiled_sql(MarkedReport("q", "SELECT 1", {})) is expected
+
+    @pytest.mark.parametrize("obj", [template("SELECT 1"), "SELECT 1", 1, None, param(1)])
+    def test_other_objects(self, obj):
+        assert not is_compiled_sql(obj)
+
+
+class TestEmbeddingCompiledSql:
+    def test_part_raises(self):
+        with pytest.raises(TypeError, match="Cannot embed compiled SQL \\(CompiledSql\\)"):
+            template("SELECT * FROM (", compile("SELECT 1"), ")")
+
+    def test_foreign_part_raises(self):
+        with pytest.raises(TypeError, match="Cannot embed compiled SQL \\(BuiltQuery\\)"):
+            template("SELECT * FROM (", BuiltQuery("SELECT 1"), ")")
+
+    def test_dataclass_part_is_a_param(self):
+        report = sales_report()
+        compiled = compile("INSERT INTO report_archive (report) VALUES (", report, ")")
+        assert compiled == CompiledSql("INSERT INTO report_archive (report) VALUES ($p0)", {"p0": report})
+
+    def test_dataclass_interpolation_is_a_param(self):
+        report = sales_report()
+        interp = FakeInterpolation(report, expression="report")
+        compiled = compile("INSERT INTO report_archive (report) VALUES (", interp, ")")
+        assert compiled == CompiledSql("INSERT INTO report_archive (report) VALUES ($p0_report)", {"p0_report": report})
+
+    def test_mock_interpolation_is_a_param(self):
+        user_id = Mock(name="user_id")
+        interp = FakeInterpolation(user_id, expression="user_id")
+        compiled = compile("SELECT * FROM users WHERE id = ", interp)
+        assert compiled == CompiledSql("SELECT * FROM users WHERE id = $p0_user_id", {"p0_user_id": user_id})
+
+    def test_specced_magic_mock_is_a_param(self):
+        """A MagicMock standing in for a SavedReport has `sql` and `params`, and is bound like the real thing."""
+        report = MagicMock(spec=sales_report())
+        assert compile("INSERT INTO report_archive (report) VALUES (", report, ")").params == {"p0": report}
+
+    def test_interpolation_raises_at_compile(self):
+        t = template("SELECT * FROM (", FakeInterpolation(compile("SELECT 1"), expression="sub"), ")")
+        with pytest.raises(TypeError, match="Cannot embed compiled SQL"):
+            t.compile()
+
+    def test_returned_from_sql_template_raises_at_compile(self):
+        class Wrapper:
+            def __sql_template__(self, **kwargs):
+                return compile("SELECT 1")
+
+        t = template("SELECT * FROM (", Wrapper(), ")")
+        with pytest.raises(TypeError, match="Cannot embed compiled SQL"):
+            t.compile()
+
+    def test_param_binds_it_as_a_value(self):
+        c = CompiledSql("SELECT 1")
+        assert compile("SELECT ", param(c)).params == {"p0": c}
+
+    def test_param_object_takes_precedence(self):
+        class Both(ForeignParam):
+            __sql_compiled__ = True
+
+        assert compile("SELECT ", Both(1, "x")).params == {"p0_x": 1}
+
+    def test_composable_takes_precedence(self):
+        class ComposableBuiltQuery(BuiltQuery):
+            def __sql_template__(self, **kwargs):
+                return "SELECT 1"
+
+        assert compile(ComposableBuiltQuery("ignored")).sql == "SELECT 1"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1068,3 +1205,89 @@ class TestErrorNotes:
         with pytest.raises(ValueError, match="Duplicate parameter names") as exc_info:
             t.compile()
         assert exc_info.value.__notes__ == [f"while compiling SqlTemplate created at {__file__}:{line}"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SPEC.md interop
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@dataclasses.dataclass
+class ForeignParam:
+    """A parameter object from a library that does not import sqltemplatelib."""
+
+    __sql_param__ = True  # No annotation, so a class attribute rather than a dataclass field.
+
+    value: object
+    name: str | None = None
+    exact: bool = False
+
+
+class TestIsSqlParam:
+    def test_param(self):
+        assert is_sql_param(param(1))
+
+    def test_foreign_param(self):
+        assert is_sql_param(ForeignParam(1))
+
+    @pytest.mark.parametrize(("marker", "expected"), [(1, True), ("yes", True), (0, False), (None, False)])
+    def test_marker_truthiness_decides(self, marker, expected):
+        class Marked(ForeignParam):
+            __sql_param__ = marker
+
+        assert is_sql_param(Marked(1)) is expected
+
+    def test_param_type_itself_is_not_a_param(self):
+        assert not is_sql_param(Param)
+        assert compile("SELECT ", Param).params == {"p0": Param}
+
+    def test_instance_attribute_is_ignored(self):
+        report = sales_report()
+        report.__sql_param__ = True
+        assert not is_sql_param(report)
+
+    @pytest.mark.parametrize("mock", [Mock(), MagicMock()])
+    def test_mock(self, mock):
+        """Mocks answer every attribute, including `value`, `name`, and `exact`."""
+        assert not is_sql_param(mock)
+
+    @pytest.mark.parametrize("obj", [template("SELECT 1"), "SELECT 1", 1, None, CompiledSql("SELECT 1")])
+    def test_other_objects(self, obj):
+        assert not is_sql_param(obj)
+
+
+class TestForeignParam:
+    def test_part(self):
+        assert compile("SELECT ", ForeignParam(1, "x")) == CompiledSql("SELECT $p0_x", {"p0_x": 1})
+
+    def test_exact(self):
+        assert compile("SELECT ", ForeignParam(1, "x", exact=True)) == CompiledSql("SELECT $x", {"x": 1})
+
+    def test_list_value_is_one_param(self):
+        assert compile("SELECT ", ForeignParam([1, 2])).params == {"p0": [1, 2]}
+
+    def test_truthy_marker(self):
+        class TruthyParam(ForeignParam):
+            __sql_param__ = 1
+
+        assert compile("SELECT ", TruthyParam(1)).params == {"p0": 1}
+
+    def test_missing_value_raises(self):
+        class NoValue:
+            __sql_param__ = True
+
+        with pytest.raises(TypeError, match="NoValue sets __sql_param__ but has no `value` attribute"):
+            template("SELECT ", NoValue())
+
+    def test_returned_from_sql_template(self):
+        class Age:
+            def __sql_template__(self, **kwargs):
+                return ("age >= ", ForeignParam(18, "min_age"))
+
+        assert compile("WHERE ", Age()) == CompiledSql("WHERE age >= $p0_min_age", {"p0_min_age": 18})
+
+
+def test_sql_template_is_composable():
+    t = template("SELECT ", param(1, "x"))
+    assert isinstance(t, SupportsSqlTemplate)
+    assert template(*t.__sql_template__()).compile() == t.compile()
