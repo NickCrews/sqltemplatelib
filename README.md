@@ -207,7 +207,6 @@ This package focuses on the part those don't share: a common protocol so objects
 ## Open questions
 
 - Identifiers and literals. `!s` inserts raw text. psycopg uses `:i` / `:l` format specs that quote correctly. Quoting is dialect-specific, so it would need per-database compilers that call `compile_parts()` with their own hooks.
-- Default compiler. `sqlite3` is the default because it ships with Python. A neutral library could instead require one.
 - A `join()` helper for building lists of fragments.
 
 ## Development
