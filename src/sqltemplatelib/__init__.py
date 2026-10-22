@@ -69,9 +69,9 @@ class CompiledSql:
     Example:
     >>> age = 37
     >>> compile(t"SELECT * FROM users WHERE age >= {age}")
-    CompiledSql(sql='SELECT * FROM users WHERE age >= $p0_age', params={'p0_age': 37})
-    >>> compile(t"SELECT * FROM users WHERE age >= {age}", compiler="sqlite3")
     CompiledSql(sql='SELECT * FROM users WHERE age >= ?', params=(37,))
+    >>> compile(t"SELECT * FROM users WHERE age >= {age}", compiler="duckdb")
+    CompiledSql(sql='SELECT * FROM users WHERE age >= $p0_age', params={'p0_age': 37})
 
     `__sql_compiled__` marks this as compiled SQL as defined in SPEC.md, so it cannot be embedded in a template.
     """
@@ -208,7 +208,7 @@ def template(*parts: str | IntoInterpolation | Param | SupportsSqlTemplate | obj
     >>> t
     SqlTemplate('SELECT * FROM users WHERE id = 123')
     >>> t.compile()
-    CompiledSql(sql='SELECT * FROM users WHERE id = 123', params={})
+    CompiledSql(sql='SELECT * FROM users WHERE id = 123', params=())
 
     In python 3.14+, [tstrings](https://docs.python.org/3/library/string.templatelib.html)
     are very useful here.
@@ -217,13 +217,13 @@ def template(*parts: str | IntoInterpolation | Param | SupportsSqlTemplate | obj
 
     >>> user_id = 123
     >>> template(t"SELECT * FROM users WHERE id = {user_id}").compile()
-    CompiledSql(sql='SELECT * FROM users WHERE id = $p0_user_id', params={'p0_user_id': 123})
+    CompiledSql(sql='SELECT * FROM users WHERE id = ?', params=(123,))
 
     Templates nest:
     >>> age = 18
     >>> adults = template(t"SELECT * FROM people WHERE age >= {age}")
     >>> template(t"SELECT name FROM ({adults})").compile()
-    CompiledSql(sql='SELECT name FROM (SELECT * FROM people WHERE age >= $p0_age)', params={'p0_age': 18})
+    CompiledSql(sql='SELECT name FROM (SELECT * FROM people WHERE age >= ?)', params=(18,))
 
     We also support iterables of strings and Interpolations/Params/etc,
     which will be joined together into a single template.
@@ -231,7 +231,7 @@ def template(*parts: str | IntoInterpolation | Param | SupportsSqlTemplate | obj
     since it allows you to build up a template from smaller pieces:
 
     >>> template("SELECT * FROM (", adults, ") WHERE age >= ", age).compile()
-    CompiledSql(sql='SELECT * FROM (SELECT * FROM people WHERE age >= $p0_age) WHERE age >= $p1', params={'p0_age': 18, 'p1': 18})
+    CompiledSql(sql='SELECT * FROM (SELECT * FROM people WHERE age >= ?) WHERE age >= ?', params=(18, 18))
 
     You can define evaluation logic for your custom types by defining a `.__sql_template__()` method.
     If this method is defined, the result of that call will be used to create the template.
@@ -248,8 +248,8 @@ def template(*parts: str | IntoInterpolation | Param | SupportsSqlTemplate | obj
     ...         # note the use of !s to indicate that the table name should be treated as raw SQL
     ...         return t"SELECT * FROM {self.table_name!s} WHERE id = {id}"
     >>> template(Record("users", 123)).compile()
-    CompiledSql(sql='SELECT * FROM users WHERE id = $p0_id', params={'p0_id': 123})
-    """  # noqa: E501
+    CompiledSql(sql='SELECT * FROM users WHERE id = ?', params=(123,))
+    """
     expanded: list[str | IntoInterpolation] = []
     for part in parts:
         expanded.extend(_expand_part(part))
@@ -258,7 +258,7 @@ def template(*parts: str | IntoInterpolation | Param | SupportsSqlTemplate | obj
 
 def compile(
     *parts: str | IntoInterpolation | Param | SupportsSqlTemplate | object,
-    compiler: str | Compiler = "duckdb",
+    compiler: str | Compiler = "sqlite3",
 ) -> CompiledSql:
     """Compile a sequence of things into a final SQL string with parameter placeholders, and the params.
 
@@ -471,7 +471,7 @@ class SqlTemplate:
         """
         return _resolve(self, self._site)
 
-    def compile(self, compiler: str | Compiler = "duckdb") -> CompiledSql:
+    def compile(self, compiler: str | Compiler = "sqlite3") -> CompiledSql:
         """Compile this template into a final SQL string with parameter placeholders, and the params.
 
         `compiler` is a Compiler, or the name of one in the registry: a driver name or a paramstyle.
@@ -479,6 +479,8 @@ class SqlTemplate:
 
         >>> t = template("SELECT * FROM people WHERE age >= ", param(18, "age"))
         >>> t.compile()
+        CompiledSql(sql='SELECT * FROM people WHERE age >= ?', params=(18,))
+        >>> t.compile("duckdb")
         CompiledSql(sql='SELECT * FROM people WHERE age >= $p0_age', params={'p0_age': 18})
         >>> t.compile("asyncpg")
         CompiledSql(sql='SELECT * FROM people WHERE age >= $1', params=(18,))

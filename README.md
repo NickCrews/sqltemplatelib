@@ -104,7 +104,7 @@ class UserFilters:
 
 
 filters = UserFilters(min_age=18)
-template(t"SELECT * FROM users WHERE {filters}").compile()
+template(t"SELECT * FROM users WHERE {filters}").compile("duckdb")
 # CompiledSql(sql='SELECT * FROM users WHERE true AND age >= $p0_min_age', params={'p0_min_age': 18})
 ```
 
@@ -120,7 +120,7 @@ A compiler turns a `SqlTemplate` into a `CompiledSql` for a particular driver. P
 from sqltemplatelib import DbApiCompiler, param, template
 
 t = template("SELECT * FROM people WHERE age >= ", param(18, "age"))
-t.compile()  # same as t.compile("duckdb")
+t.compile()  # same as t.compile("sqlite3")
 t.compile("asyncpg")  # CompiledSql(sql='SELECT * FROM people WHERE age >= $1', params=(18,))
 t.compile("format")  # ... age >= %s', params=(18,))
 t.compile(DbApiCompiler("format"))  # same as above
@@ -128,18 +128,18 @@ t.compile(DbApiCompiler("format"))  # same as above
 
 Drivers are named by their import name, since that is what appears in your code and stdlib `sqlite3` has no PyPI name. Each uses the driver's own `paramstyle`, except `duckdb`, which declares `qmark` but also accepts `$name`.
 
-| name               | paramstyle       | placeholder | params |
-|--------------------|------------------|-------------|--------|
-| `duckdb` (default) | `dollar`         | `$name`     | dict   |
-| `sqlite3`          | `qmark`          | `?`         | tuple  |
-| `psycopg`          | `pyformat`       | `%(name)s`  | dict   |
-| `psycopg2`         | `pyformat`       | `%(name)s`  | dict   |
-| `pg8000`           | `format`         | `%s`        | tuple  |
-| `asyncpg`          | `dollar_numeric` | `$1`        | tuple  |
-| `pymysql`          | `pyformat`       | `%(name)s`  | dict   |
-| `MySQLdb`          | `format`         | `%s`        | tuple  |
-| `mysql.connector`  | `pyformat`       | `%(name)s`  | dict   |
-| `oracledb`         | `named`          | `:name`     | dict   |
+| name                | paramstyle       | placeholder | params |
+|---------------------|------------------|-------------|--------|
+| `sqlite3` (default) | `qmark`          | `?`         | tuple  |
+| `duckdb`            | `dollar`         | `$name`     | dict   |
+| `psycopg`           | `pyformat`       | `%(name)s`  | dict   |
+| `psycopg2`          | `pyformat`       | `%(name)s`  | dict   |
+| `pg8000`            | `format`         | `%s`        | tuple  |
+| `asyncpg`           | `dollar_numeric` | `$1`        | tuple  |
+| `pymysql`           | `pyformat`       | `%(name)s`  | dict   |
+| `MySQLdb`           | `format`         | `%s`        | tuple  |
+| `mysql.connector`   | `pyformat`       | `%(name)s`  | dict   |
+| `oracledb`          | `named`          | `:name`     | dict   |
 
 Most drivers accept more than one paramstyle. To use another, pass its name:
 
@@ -207,7 +207,7 @@ This package focuses on the part those don't share: a common protocol so objects
 ## Open questions
 
 - Identifiers and literals. `!s` inserts raw text. psycopg uses `:i` / `:l` format specs that quote correctly. Quoting is dialect-specific, so it would need per-database compilers that call `compile_parts()` with their own hooks.
-- Default compiler. `duckdb` is the default because the API comes from DuckDB. A neutral library could instead require one.
+- Default compiler. `sqlite3` is the default because it ships with Python. A neutral library could instead require one.
 - A `join()` helper for building lists of fragments.
 
 ## Development

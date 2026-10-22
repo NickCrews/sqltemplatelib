@@ -48,9 +48,9 @@ def test_all_paramstyles_covered():
     assert set(PARAMSTYLES) == {"dollar", "named", "pyformat", "qmark", "format", "numeric", "dollar_numeric"}
 
 
-def test_default_compiler_is_duckdb():
-    assert compile("SELECT ", 1).sql == "SELECT $p0"
-    assert template("SELECT ", 1).compile().sql == "SELECT $p0"
+def test_default_compiler_is_sqlite3():
+    assert compile("SELECT ", 1) == CompiledSql("SELECT ?", (1,))
+    assert template("SELECT ", 1).compile() == CompiledSql("SELECT ?", (1,))
 
 
 def test_unknown_paramstyle_raises():
@@ -167,9 +167,9 @@ class TestRegistry:
     @pytest.mark.usefixtures("restore_registry")
     def test_register_existing_name_raises_without_overwrite(self):
         with pytest.raises(ValueError, match="already registered"):
-            register_compiler("duckdb", DbApiCompiler("qmark"))
-        register_compiler("duckdb", DbApiCompiler("qmark"), overwrite=True)
-        assert compile("SELECT ", 1).sql == "SELECT ?"
+            register_compiler("sqlite3", DbApiCompiler("dollar"))
+        register_compiler("sqlite3", DbApiCompiler("dollar"), overwrite=True)
+        assert compile("SELECT ", 1).sql == "SELECT $p0"
 
     def test_register_non_compiler_raises(self):
         with pytest.raises(TypeError, match="Expected a Compiler"):
@@ -200,7 +200,7 @@ class TestParamNames:
 
     @pytest.mark.parametrize("name", ["p", "_p", "param_1", "CamelCase"])
     def test_legal_exact_names(self, name):
-        assert compile(param(1, name, exact=True)).params == {name: 1}
+        assert compile(param(1, name, exact=True), compiler="duckdb").params == {name: 1}
 
     @pytest.mark.parametrize(
         ("name", "expected"),
@@ -213,7 +213,7 @@ class TestParamNames:
         ],
     )
     def test_non_exact_names_are_sanitized(self, name, expected):
-        assert compile(param(1, name)).params == {expected: 1}
+        assert compile(param(1, name), compiler="duckdb").params == {expected: 1}
 
 
 def test_plain_str_part_is_raw_sql():
