@@ -9,8 +9,13 @@ import pytest
 
 from sqltemplatelib import (
     CompiledSql,
+    FlatTemplate,
+    Ident,
+    Lit,
     Param,
     compile,
+    ident,
+    lit,
     param,
     template,
 )
@@ -110,6 +115,44 @@ class TestTStringConversions:
         compiled = t.compile("duckdb")
         assert 3.14159 in compiled.params.values()
         assert "3.14" not in compiled.sql
+
+
+class TestFormatSpecs:
+    def test_i_makes_an_ident(self):
+        table = "user data"
+        assert template(t"SELECT * FROM {table:i}").expand() == FlatTemplate(["SELECT * FROM ", Ident("user data")])
+        assert compile(t"SELECT * FROM {table:i}", "pymysql").sql == "SELECT * FROM `user data`"
+
+    def test_i_needs_a_str(self):
+        table = 5
+        with pytest.raises(TypeError, match=r"\{table:i\} needs a str"):
+            compile(t"SELECT * FROM {table:i}")
+
+    def test_l_makes_a_lit(self):
+        default = "it's"
+        assert template(t"DEFAULT {default:l}").expand() == FlatTemplate(["DEFAULT ", Lit("it's")])
+        assert compile(t"DEFAULT {default:l}").sql == "DEFAULT 'it''s'"
+
+    def test_ident_and_lit_objects_ignore_format_spec_and_conversion(self):
+        t_name, value = ident("t"), lit(1)
+        assert compile(t"SELECT {value!s} FROM {t_name:l}").sql == 'SELECT 1 FROM "t"'
+
+    def test_conversion_takes_precedence_over_format_spec(self):
+        name = "t"
+        with pytest.raises(ValueError, match="Unknown format code 'i'"):
+            compile(t"SELECT * FROM {name!s:i}")
+
+    def test_injection_attempt_via_ident_and_lit(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE t (x TEXT)")
+        evil_table = 't"; DROP TABLE t; --'
+        evil_value = "x'); DROP TABLE t; --"
+        c = compile(t"INSERT INTO {evil_table:i} VALUES ({evil_value:l})")
+        with pytest.raises(sqlite3.OperationalError, match="no such table"):
+            conn.execute(c.sql, c.params)
+        c = compile(t"INSERT INTO {'t':i} VALUES ({evil_value:l})")
+        conn.execute(c.sql, c.params)
+        assert conn.execute("SELECT x FROM t").fetchall() == [(evil_value,)]
 
 
 class TestTStringNesting:

@@ -4,18 +4,18 @@ import sqlite3
 
 import pytest
 
-from sqltemplatelib import _COMPILERS as COMPILERS
+from sqltemplatelib import _RENDERERS as RENDERERS
 from sqltemplatelib import (
     PARAMSTYLES,
     CompiledSql,
-    Compiler,
-    DbApiCompiler,
+    DbApiRenderer,
     Param,
+    SqlRenderer,
     compile,
-    compile_parts,
-    get_compiler,
+    get_renderer,
     param,
-    register_compiler,
+    register_renderer,
+    render_parts,
     template,
 )
 
@@ -39,7 +39,7 @@ AGE_QUERY = ("SELECT * FROM people WHERE age >= ", param(18, "age"), " AND name 
     ],
 )
 def test_paramstyles(paramstyle, sql, params):
-    compiled = compile(AGE_QUERY, compiler=DbApiCompiler(paramstyle=paramstyle))
+    compiled = compile(AGE_QUERY, renderer=DbApiRenderer(paramstyle=paramstyle))
     assert compiled.sql == sql
     assert compiled.params == params
 
@@ -48,17 +48,17 @@ def test_all_paramstyles_covered():
     assert set(PARAMSTYLES) == {"dollar", "named", "pyformat", "qmark", "format", "numeric", "dollar_numeric"}
 
 
-def test_default_compiler_is_sqlite3():
+def test_default_renderer_is_sqlite3():
     assert compile(["SELECT ", 1]) == CompiledSql("SELECT ?", (1,))
     assert template("SELECT ", 1).compile() == CompiledSql("SELECT ?", (1,))
 
 
-def test_compile_takes_compiler_positionally():
+def test_compile_takes_renderer_positionally():
     assert compile(["SELECT ", 1], "duckdb") == CompiledSql("SELECT $p0", {"p0": 1})
 
 
-def test_compile_takes_compiler_keyword():
-    assert compile(["SELECT ", 1], compiler="duckdb") == CompiledSql("SELECT $p0", {"p0": 1})
+def test_compile_takes_renderer_keyword():
+    assert compile(["SELECT ", 1], renderer="duckdb") == CompiledSql("SELECT $p0", {"p0": 1})
 
 
 @pytest.mark.parametrize(
@@ -82,15 +82,15 @@ def test_compile_does_not_iterate_str_or_bytes():
 
 def test_unknown_paramstyle_raises():
     with pytest.raises(ValueError, match="Unknown paramstyle"):
-        DbApiCompiler(paramstyle="bogus")  # type: ignore[arg-type]
+        DbApiRenderer(paramstyle="bogus")  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("paramstyle", PARAMSTYLES)
 def test_paramstyle_names_are_registered(paramstyle):
-    assert get_compiler(paramstyle) == DbApiCompiler(paramstyle)
+    assert get_renderer(paramstyle) == DbApiRenderer(paramstyle)
 
 
-class TestCompilePartsHooks:
+class TestRenderPartsHooks:
     def test_placeholder_gets_name_and_position(self):
         calls = []
 
@@ -98,49 +98,49 @@ class TestCompilePartsHooks:
             calls.append((name, position))
             return "?"
 
-        compile_parts(["a = ", param(1, "a"), " AND b = ", param(2)], placeholder=placeholder, named=False)
+        render_parts(["a = ", param(1, "a"), " AND b = ", param(2)], placeholder=placeholder, named=False)
         assert calls == [("p0_a", 1), ("p1", 2)]
 
     def test_custom_placeholder(self):
-        compiled = compile_parts(["SELECT ", param(1, "x")], placeholder=lambda name, _: f"@{name}", named=True)
+        compiled = render_parts(["SELECT ", param(1, "x")], placeholder=lambda name, _: f"@{name}", named=True)
         assert compiled == CompiledSql("SELECT @p0_x", {"p0_x": 1})
 
     def test_escape_percent_is_independent_of_placeholder(self):
-        compiled = compile_parts(
+        compiled = render_parts(
             ["SELECT 10 % ", param(3)], placeholder=lambda *_: "?", named=False, escape_percent=True
         )
         assert compiled.sql == "SELECT 10 %% ?"
 
 
 def _dbapi(paramstyle):
-    return DbApiCompiler(paramstyle=paramstyle)
+    return DbApiRenderer(paramstyle=paramstyle)
 
 
 @pytest.mark.parametrize("paramstyle", ["pyformat", "format"])
 def test_percent_escaped_for_percent_styles(paramstyle):
-    compiled = compile(["SELECT 10 % 3, 'a%' LIKE ", "x"], compiler=_dbapi(paramstyle))
+    compiled = compile(["SELECT 10 % 3, 'a%' LIKE ", "x"], renderer=_dbapi(paramstyle))
     assert compiled.sql.startswith("SELECT 10 %% 3, 'a%%' LIKE ")
 
 
 @pytest.mark.parametrize("paramstyle", ["dollar", "named", "qmark", "numeric", "dollar_numeric"])
 def test_percent_not_escaped_for_other_styles(paramstyle):
-    assert compile("SELECT 10 % 3", compiler=_dbapi(paramstyle)).sql == "SELECT 10 % 3"
+    assert compile("SELECT 10 % 3", renderer=_dbapi(paramstyle)).sql == "SELECT 10 % 3"
 
 
 def test_duplicate_exact_names_raise_for_named_styles():
     parts = (param(1, "x", exact=True), param(2, "x", exact=True))
     with pytest.raises(ValueError, match="Duplicate parameter names"):
-        compile(parts, compiler=_dbapi("named"))
+        compile(parts, renderer=_dbapi("named"))
 
 
 def test_duplicate_exact_names_ok_for_positional_styles():
     parts = (param(1, "x", exact=True), param(2, "x", exact=True))
-    assert compile(parts, compiler=_dbapi("qmark")).params == (1, 2)
+    assert compile(parts, renderer=_dbapi("qmark")).params == (1, 2)
 
 
-def test_compile_method_accepts_compiler_positionally():
+def test_compile_method_accepts_renderer_positionally():
     t = template("SELECT ", 1)
-    assert t.compile(DbApiCompiler("qmark")).params == (1,)
+    assert t.compile(DbApiRenderer("qmark")).params == (1,)
     assert t.compile("sqlite3").params == (1,)
 
 
@@ -165,58 +165,57 @@ class TestRegistry:
         assert compiled.sql == sql
         assert compiled.params == params
 
-    def test_compiler_instance_returned_as_is(self):
-        compiler = DbApiCompiler("named")
-        assert get_compiler(compiler) is compiler
+    def test_renderer_instance_returned_as_is(self):
+        renderer = DbApiRenderer("named")
+        assert get_renderer(renderer) is renderer
 
     def test_unknown_name_raises(self):
-        with pytest.raises(ValueError, match="Unknown compiler: 'oracle'"):
-            get_compiler("oracle")
+        with pytest.raises(ValueError, match="Unknown renderer: 'oracle'"):
+            get_renderer("oracle")
 
     @pytest.fixture
     def restore_registry(self):
-        saved = dict(COMPILERS)
+        saved = dict(RENDERERS)
         yield
-        COMPILERS.clear()
-        COMPILERS.update(saved)
+        RENDERERS.clear()
+        RENDERERS.update(saved)
 
     @pytest.mark.usefixtures("restore_registry")
-    def test_register_custom_compiler(self):
-        class UppercaseCompiler:
-            def __sql_compile__(self, template):
-                parts = template.resolve()
+    def test_register_custom_renderer(self):
+        class UppercaseRenderer:
+            def __sql_render__(self, parts, **future_kwargs):
                 sql = "".join(p if isinstance(p, str) else "?" for p in parts)
                 return CompiledSql(sql=sql.upper(), params=tuple(p.value for p in parts if isinstance(p, Param)))
 
-        register_compiler("upper", UppercaseCompiler())
-        assert compile(["select ", 1], compiler="upper").sql == "SELECT ?"
+        register_renderer("upper", UppercaseRenderer())
+        assert compile(["select ", 1], renderer="upper").sql == "SELECT ?"
 
     @pytest.mark.usefixtures("restore_registry")
     def test_register_existing_name_raises_without_overwrite(self):
         with pytest.raises(ValueError, match="already registered"):
-            register_compiler("sqlite3", DbApiCompiler("dollar"))
-        register_compiler("sqlite3", DbApiCompiler("dollar"), overwrite=True)
+            register_renderer("sqlite3", DbApiRenderer("dollar"))
+        register_renderer("sqlite3", DbApiRenderer("dollar"), overwrite=True)
         assert compile(["SELECT ", 1]).sql == "SELECT $p0"
 
-    def test_register_non_compiler_raises(self):
-        with pytest.raises(TypeError, match="Expected a Compiler"):
-            register_compiler("bad", "qmark")  # type: ignore[arg-type]
+    def test_register_non_renderer_raises(self):
+        with pytest.raises(TypeError, match="Expected a SqlRenderer"):
+            register_renderer("bad", "qmark")  # type: ignore[arg-type]
 
-    def test_plain_callable_is_not_a_compiler(self):
-        with pytest.raises(TypeError, match="Expected a Compiler, got function"):
-            register_compiler("bad", lambda template: CompiledSql(""))  # type: ignore[arg-type]
+    def test_plain_callable_is_not_a_renderer(self):
+        with pytest.raises(TypeError, match="Expected a SqlRenderer, got function"):
+            register_renderer("bad", lambda parts: CompiledSql(""))  # type: ignore[arg-type]
 
-    @pytest.mark.parametrize("bad", [5, None, lambda template: CompiledSql("")])
-    def test_get_compiler_rejects_non_compilers(self, bad):
-        with pytest.raises(TypeError, match="Expected a compiler name or a Compiler"):
-            get_compiler(bad)
+    @pytest.mark.parametrize("bad", [5, None, lambda parts: CompiledSql("")])
+    def test_get_renderer_rejects_non_renderers(self, bad):
+        with pytest.raises(TypeError, match="Expected a renderer name or a SqlRenderer"):
+            get_renderer(bad)
 
-    def test_compile_rejects_non_compiler(self):
-        with pytest.raises(TypeError, match="Expected a compiler name or a Compiler, got int"):
+    def test_compile_rejects_non_renderer(self):
+        with pytest.raises(TypeError, match="Expected a renderer name or a SqlRenderer, got int"):
             template("SELECT ", 1).compile(5)  # type: ignore[arg-type]
 
-    def test_builtin_compilers_satisfy_protocol(self):
-        assert all(isinstance(c, Compiler) for c in COMPILERS.values())
+    def test_builtin_renderers_satisfy_protocol(self):
+        assert all(isinstance(r, SqlRenderer) for r in RENDERERS.values())
 
 
 class TestParamNames:
@@ -227,7 +226,7 @@ class TestParamNames:
 
     @pytest.mark.parametrize("name", ["p", "_p", "param_1", "CamelCase"])
     def test_legal_exact_names(self, name):
-        assert compile(param(1, name, exact=True), compiler="duckdb").params == {name: 1}
+        assert compile(param(1, name, exact=True), renderer="duckdb").params == {name: 1}
 
     @pytest.mark.parametrize(
         ("name", "expected"),
@@ -240,7 +239,7 @@ class TestParamNames:
         ],
     )
     def test_non_exact_names_are_sanitized(self, name, expected):
-        assert compile(param(1, name), compiler="duckdb").params == {expected: 1}
+        assert compile(param(1, name), renderer="duckdb").params == {expected: 1}
 
 
 def test_plain_str_part_is_raw_sql():
@@ -268,7 +267,7 @@ class TestSqlite3:
 
     def test_injection_is_a_param(self, conn):
         evil = "x'; DROP TABLE people; --"
-        compiled = compile(["SELECT count(*) FROM people WHERE name = ", param(evil)], compiler="sqlite3")
+        compiled = compile(["SELECT count(*) FROM people WHERE name = ", param(evil)], renderer="sqlite3")
         assert conn.execute(compiled.sql, compiled.params).fetchall() == [(0,)]
         assert conn.execute("SELECT count(*) FROM people").fetchall() == [(3,)]
 
