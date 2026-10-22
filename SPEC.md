@@ -156,7 +156,7 @@ A library that executes SQL accepts any TemplateLike, typically a t-string or a 
 
 If the query itself is compiled SQL and is not composable or a template, the consumer MAY skip compilation and pass its `sql` and `params` to the driver unchanged. The caller compiled it for this driver, so its placeholders are already in the right syntax, and there is no enclosing query for its names to collide with.
 
-A consumer does not need `sqltemplatelib`. One that uses it calls `template(obj).expand()` for expansion, and a renderer or `render_parts()` for rendering, or `template(obj).compile(renderer)` for both.
+A consumer does not need `sqltemplatelib`. One that uses it calls `expand(obj)` for expansion, `render(flat, renderer)` for rendering, or `compile(obj, renderer)` for both. A custom renderer can use `render_parts()`.
 
 ## Limitations
 

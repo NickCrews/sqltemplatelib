@@ -1211,6 +1211,12 @@ class TestErrorNotes:
             t.compile("duckdb")
         assert exc_info.value.__notes__ == [f"while compiling SqlTemplate created at {__file__}:{line}"]
 
+    def test_compile_function_notes_creation_site_of_parts(self):
+        with pytest.raises(ValueError, match="Duplicate parameter names") as exc_info:
+            compile([param(1, "x", exact=True), param(2, "x", exact=True)], "duckdb")
+        line = sys._getframe().f_lineno - 1
+        assert exc_info.value.__notes__ == [f"while compiling SqlTemplate created at {__file__}:{line}"]
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SPEC.md interop

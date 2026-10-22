@@ -5,7 +5,7 @@ Composable, injection-safe SQL templates built on Python [t-strings](https://doc
 This project is two things:
 
 - **A spec** ([SPEC.md](SPEC.md)). It defines how any input (strings, t-strings, parameters, identifiers, literals, nested templates, and objects implementing `__sql_template__`) expands into a *flat template*, a flat sequence of SQL text, parameters, identifiers, and literals. Expansion does not depend on the database, so every consumer gets the same flat template from the same input, and templates and objects from different libraries nest inside each other's queries. A *renderer* then writes the flat template in one driver's syntax, under rules that keep its meaning intact. Producers and consumers can follow the spec without importing this package.
-- **A reference implementation** (this package). `.expand()` does the expansion, and renderers for common drivers do the rendering. Use it to avoid implementing the spec yourself.
+- **A reference implementation** (this package). `expand()` does the expansion, and `render()`, with renderers for common drivers, does the rendering. Use it to avoid implementing the spec yourself.
 
 The implementation:
 
@@ -42,13 +42,15 @@ sqlite3.connect(":memory:").execute(c.sql, c.params)
 The spec's stages map onto this package's types:
 
 ```
-input ──template()──▶ SqlTemplate ──.expand()──▶ FlatTemplate ──renderer──▶ CompiledSql
-                                  └──────── .compile(renderer) ────────┘
+input ──template()──▶ SqlTemplate ──expand()──▶ FlatTemplate ──render(renderer)──▶ CompiledSql
+└───────────────────────────────── compile(input, renderer) ─────────────────────────────────┘
 ```
 
 - `SqlTemplate`: the input, as written. Nested templates and `__sql_template__()` objects stay unexpanded.
 - `FlatTemplate`: SQL text, `Param`s, `Ident`s, and `Lit`s, with nothing left to expand. Most users never see it; it is what a renderer receives.
 - `CompiledSql`: final `.sql` string and `.params` (dict for named styles, tuple for positional).
+
+`expand()` and `compile()` accept anything `template()` does, so you rarely need to call `template()` yourself. `SqlTemplate.expand()` and `SqlTemplate.compile(renderer)` are shorthands for `expand(t)` and `compile(t, renderer)`.
 
 `compile()` expands interpolations, calling `__sql_template__()` at that point, so the SQL reflects each object's state at compile time. If expansion fails, the exception gets notes naming each interpolation and the file and line where each enclosing `SqlTemplate` was created:
 
@@ -148,7 +150,7 @@ class UserFilters:
 
 
 filters = UserFilters(min_age=18)
-template(t"SELECT * FROM users WHERE {filters}").compile("duckdb")
+compile(t"SELECT * FROM users WHERE {filters}", "duckdb")
 # CompiledSql(sql='SELECT * FROM users WHERE true AND age >= $p0_min_age', params={'p0_min_age': 18})
 ```
 
@@ -158,16 +160,16 @@ The protocol is duck-typed: a library such as a dataframe or query-builder packa
 
 ## Renderers
 
-A renderer turns a `FlatTemplate` into a `CompiledSql` for a particular database and driver. Pass `.compile()` a driver name, a paramstyle, or a renderer:
+A renderer turns a `FlatTemplate` into a `CompiledSql` for a particular database and driver. Pass `compile()` or `render()` a driver name, a paramstyle, or a renderer:
 
 ```python
-from sqltemplatelib import DbApiRenderer, param, template
+from sqltemplatelib import DbApiRenderer, compile, param
 
-t = template("SELECT * FROM people WHERE age >= ", param(18, "age"))
-t.compile()  # same as t.compile("sqlite3")
-t.compile("asyncpg")  # CompiledSql(sql='SELECT * FROM people WHERE age >= $1', params=(18,))
-t.compile("format")  # ... age >= %s', params=(18,))
-t.compile(DbApiRenderer("format"))  # same as above
+q = ["SELECT * FROM people WHERE age >= ", param(18, "age")]
+compile(q)  # same as compile(q, "sqlite3")
+compile(q, "asyncpg")  # CompiledSql(sql='SELECT * FROM people WHERE age >= $1', params=(18,))
+compile(q, "format")  # ... age >= %s', params=(18,))
+compile(q, DbApiRenderer("format"))  # same as above
 ```
 
 Drivers are named by their import name, since that is what appears in your code and stdlib `sqlite3` has no PyPI name. Each uses the driver's own `paramstyle`, except `duckdb`, which declares `qmark` but also accepts `$name`.
@@ -206,7 +208,7 @@ To use a driver's paramstyle with another database's quoting, construct the rend
 Any object with a `__sql_render__(self, parts: FlatTemplate, /, **future_kwargs) -> CompiledSql` method satisfies the `SqlRenderer` protocol. Most renderers pass the parts to the util function `render_parts()`, which names the params and collects their values, along with hooks for the database's syntax:
 
 ```python
-from sqltemplatelib import CompiledSql, FlatTemplate, ident, param, render_parts, template
+from sqltemplatelib import CompiledSql, FlatTemplate, compile, ident, param, render_parts
 
 
 class SqlServerRenderer:
@@ -219,7 +221,7 @@ class SqlServerRenderer:
         )
 
 
-template("SELECT * FROM ", ident("people"), " WHERE age >= ", param(18, "age")).compile(SqlServerRenderer())
+compile(["SELECT * FROM ", ident("people"), " WHERE age >= ", param(18, "age")], SqlServerRenderer())
 # CompiledSql(sql='SELECT * FROM [people] WHERE age >= @p0_age', params={'p0_age': 18})
 ```
 
@@ -229,10 +231,10 @@ template("SELECT * FROM ", ident("people"), " WHERE age >= ", param(18, "age")).
 
 ## Accepting templates in a database library
 
-A library that executes SQL is a consumer in the spec's terms. It should accept any input, expand it into a flat template, and render that in its own syntax. `.compile(renderer)` does both:
+A library that executes SQL is a consumer in the spec's terms. It should accept any input, expand it into a flat template, and render that in its own syntax. `compile(query, renderer)` does both:
 
 ```python
-from sqltemplatelib import SupportsSqlTemplate, is_compiled_sql, template
+from sqltemplatelib import SupportsSqlTemplate, compile, is_compiled_sql
 from my_sql_server_renderer import SqlServerRenderer
 
 
@@ -242,7 +244,7 @@ def execute(self, query, params=None):
     elif is_compiled_sql(query) and not isinstance(query, SupportsSqlTemplate):
         query, params = query.sql, query.params
     else:
-        compiled = template(query).compile(SqlServerRenderer())
+        compiled = compile(query, SqlServerRenderer())
         query, params = compiled.sql, compiled.params
     ...
 ```

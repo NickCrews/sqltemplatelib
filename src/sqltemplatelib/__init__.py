@@ -32,6 +32,7 @@ __all__ = [
     "SqlTemplate",
     "SupportsSqlTemplate",
     "compile",
+    "expand",
     "get_renderer",
     "ident",
     "is_compiled_sql",
@@ -41,6 +42,7 @@ __all__ = [
     "lit",
     "param",
     "register_renderer",
+    "render",
     "render_parts",
     "template",
 ]
@@ -73,8 +75,7 @@ class CompiledSql:
 
     `params` is a dict for named paramstyles and a tuple for positional ones.
 
-    You will typically not create this directly, but will get it as the result
-    of calling .compile() on a SqlTemplate.
+    You will typically not create this directly, but will get it as the result of compile().
 
     Example:
     >>> age = 37
@@ -314,7 +315,7 @@ def _as_ident_or_lit(obj: object) -> Ident | Lit | None:
 class FlatTemplate(Sequence["str | Param | Ident | Lit"]):
     """A fully expanded template: SQL text, Params, Idents, and Lits, with nothing left to expand.
 
-    This is what SqlTemplate.expand() returns and what a SqlRenderer renders.
+    This is what expand() returns and what a SqlRenderer renders.
     Adjacent SQL text is merged and empty SQL text is dropped,
     so equivalent templates expand to equal FlatTemplates.
 
@@ -436,6 +437,43 @@ def template(*parts: str | IntoInterpolation | Param | SupportsSqlTemplate | obj
     return SqlTemplate(*expanded)
 
 
+def _as_template(obj: object) -> SqlTemplate:
+    """Return obj if it is a SqlTemplate, so its creation site is kept, else template(obj)."""
+    if isinstance(obj, SqlTemplate):
+        return obj
+    return template(obj)
+
+
+def expand(obj: str | IntoInterpolation | Param | SupportsSqlTemplate | object, /) -> FlatTemplate:
+    """Expand all interpolations, recursively, into a FlatTemplate.
+
+    This is the expansion described in SPEC.md. It does not depend on the database or driver;
+    render() then renders the result in a renderer's syntax.
+    `obj` is anything template() accepts as a single part, so an iterable joins several parts.
+    Calls `__sql_template__()` on any objects that implement it.
+
+    >>> expand(["SELECT * FROM people WHERE age >= ", param(18, "age")])
+    FlatTemplate('SELECT * FROM people WHERE age >= ', Param(value=18, name='age', exact=False))
+    """
+    t = _as_template(obj)
+    return FlatTemplate(_expand(t, t._site))  # noqa: SLF001
+
+
+def render(parts: Iterable[str | Param | Ident | Lit], /, renderer: str | SqlRenderer = "sqlite3") -> CompiledSql:
+    """Render expanded parts, as from expand(), into a final SQL string with parameter placeholders, and the params.
+
+    `renderer` is a SqlRenderer, or the name of one in the registry: a driver name or a paramstyle.
+    See get_renderer().
+
+    >>> flat = expand(["SELECT * FROM people WHERE age >= ", param(18, "age")])
+    >>> render(flat, "asyncpg")
+    CompiledSql(sql='SELECT * FROM people WHERE age >= $1', params=(18,))
+    """
+    if not isinstance(parts, FlatTemplate):
+        parts = FlatTemplate(parts)
+    return get_renderer(renderer).__sql_render__(parts)
+
+
 def compile(
     obj: str | IntoInterpolation | Param | SupportsSqlTemplate | object,
     /,
@@ -443,19 +481,32 @@ def compile(
 ) -> CompiledSql:
     """Compile something into a final SQL string with parameter placeholders, and the params.
 
-    This is a convenience function that combines template() and .compile() into one step.
-    `obj` is anything template() accepts as a single part,
-    so an iterable joins several parts.
-    See SqlTemplate.compile() for `renderer`, and template() for more examples.
+    Compiling is expand() followed by render() with `renderer`.
+    `obj` is anything template() accepts as a single part, so an iterable joins several parts.
+    `renderer` is a SqlRenderer, or the name of one in the registry: a driver name or a paramstyle.
+    See get_renderer(), and template() for more examples.
 
     >>> age = 18
+    >>> compile(t"SELECT * FROM people WHERE age >= {age}")
+    CompiledSql(sql='SELECT * FROM people WHERE age >= ?', params=(18,))
     >>> compile(t"SELECT * FROM people WHERE age >= {age}", "duckdb")
     CompiledSql(sql='SELECT * FROM people WHERE age >= $p0_age', params={'p0_age': 18})
+    >>> compile(t"SELECT * FROM people WHERE age >= {age}", "format")
+    CompiledSql(sql='SELECT * FROM people WHERE age >= %s', params=(18,))
     >>> parts = ["SELECT * FROM people WHERE age >= ", age]
     >>> compile(parts, "duckdb")
     CompiledSql(sql='SELECT * FROM people WHERE age >= $p0', params={'p0': 18})
     """
-    return template(obj).compile(renderer)
+    renderer = get_renderer(renderer)
+    t = _as_template(obj)
+    site = t._site  # noqa: SLF001
+    try:
+        return render(expand(t), renderer)
+    except Exception as e:
+        # Errors from expanding interpolations already carry a note naming this site.
+        if site and not any(note.endswith(_site_suffix(site)) for note in getattr(e, "__notes__", ())):
+            e.add_note(f"while compiling {_site_suffix(site)}")
+        raise
 
 
 def _is_iterable_nonstring(value: object) -> TypeIs[Iterable[object]]:
@@ -684,42 +735,12 @@ class SqlTemplate:
         return tuple(self)
 
     def expand(self) -> FlatTemplate:
-        """Expand all interpolations, recursively, into a FlatTemplate.
-
-        This is the expansion described in SPEC.md. It does not depend on the database or driver;
-        a SqlRenderer then renders the result in its own syntax.
-        Calls `__sql_template__()` on any objects that implement it.
-
-        >>> template("SELECT * FROM people WHERE age >= ", param(18, "age")).expand()
-        FlatTemplate('SELECT * FROM people WHERE age >= ', Param(value=18, name='age', exact=False))
-        """
-        return FlatTemplate(_expand(self, self._site))
+        """Same as `expand(self)`."""
+        return expand(self)
 
     def compile(self, renderer: str | SqlRenderer = "sqlite3") -> CompiledSql:
-        """Compile this template into a final SQL string with parameter placeholders, and the params.
-
-        Compiling is expand() followed by rendering the result with `renderer`.
-        `renderer` is a SqlRenderer, or the name of one in the registry: a driver name or a paramstyle.
-        See get_renderer().
-
-        >>> t = template("SELECT * FROM people WHERE age >= ", param(18, "age"))
-        >>> t.compile()
-        CompiledSql(sql='SELECT * FROM people WHERE age >= ?', params=(18,))
-        >>> t.compile("duckdb")
-        CompiledSql(sql='SELECT * FROM people WHERE age >= $p0_age', params={'p0_age': 18})
-        >>> t.compile("asyncpg")
-        CompiledSql(sql='SELECT * FROM people WHERE age >= $1', params=(18,))
-        >>> t.compile("format")
-        CompiledSql(sql='SELECT * FROM people WHERE age >= %s', params=(18,))
-        """
-        renderer = get_renderer(renderer)
-        try:
-            return renderer.__sql_render__(self.expand())
-        except Exception as e:
-            # Errors from expanding interpolations already carry a note naming this site.
-            if self._site and not any(note.endswith(_site_suffix(self._site)) for note in getattr(e, "__notes__", ())):
-                e.add_note(f"while compiling {_site_suffix(self._site)}")
-            raise
+        """Same as `compile(self, renderer)`."""
+        return compile(self, renderer)
 
     def __str__(self) -> Never:
         msg = "SqlTemplate cannot be directly converted to a string, since it may contain parameters. Please call .compile() first."  # noqa: E501
@@ -743,7 +764,7 @@ def _caller_site() -> tuple[str, int] | None:
 def _site_suffix(site: tuple[str, int]) -> str:
     """Return the end of an error note naming where a template was created.
 
-    Every note about a template ends with this, so SqlTemplate.compile() can tell whether one is already there.
+    Every note about a template ends with this, so compile() can tell whether one is already there.
     """
     filename, lineno = site
     return f"SqlTemplate created at {filename}:{lineno}"
@@ -806,7 +827,7 @@ def render_parts(  # noqa: PLR0913
     quote_ident: Callable[[str], str] | None = None,
     render_lit: Callable[[object], str] | None = None,
 ) -> CompiledSql:
-    """Render expanded parts, as from `SqlTemplate.expand()`, into a CompiledSql.
+    """Render expanded parts, as from expand(), into a CompiledSql.
 
     This does the work shared by all renderers: naming params, checking names, and collecting values.
     The caller decides the syntax:
@@ -1035,7 +1056,7 @@ _RENDERERS: dict[str, SqlRenderer] = {
 
 
 def register_renderer(name: str, renderer: SqlRenderer, *, overwrite: bool = False) -> None:
-    """Register a renderer under a name, so that `.compile(name)` uses it.
+    """Register a renderer under a name, so that `compile(obj, name)` uses it.
 
     The registry is shared by everything in the process, so be polite:
     register only names you own, such as your own package or driver name.

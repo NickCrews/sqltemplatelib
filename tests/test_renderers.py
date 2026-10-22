@@ -9,12 +9,16 @@ from sqltemplatelib import (
     PARAMSTYLES,
     CompiledSql,
     DbApiRenderer,
+    FlatTemplate,
+    Ident,
     Param,
     SqlRenderer,
     compile,
+    expand,
     get_renderer,
     param,
     register_renderer,
+    render,
     render_parts,
     template,
 )
@@ -78,6 +82,32 @@ def test_compile_joins_any_iterable(parts):
 def test_compile_does_not_iterate_str_or_bytes():
     assert compile("SELECT 1") == CompiledSql("SELECT 1", ())
     assert compile(b"abc") == CompiledSql("?", (b"abc",))
+
+
+def test_expand_joins_parts():
+    assert expand(["SELECT * FROM ", Ident("t"), " WHERE x = ", param(1)]) == FlatTemplate(
+        ["SELECT * FROM ", Ident("t"), " WHERE x = ", param(1)]
+    )
+
+
+def test_expand_method_matches_function():
+    t = template(*AGE_QUERY)
+    assert t.expand() == expand(t) == expand(AGE_QUERY)
+
+
+def test_render_accepts_flat_template_or_iterable():
+    flat = expand(AGE_QUERY)
+    expected = CompiledSql("SELECT * FROM people WHERE age >= $1 AND name = $2", (18, "Al"))
+    assert render(flat, "asyncpg") == expected
+    assert render(list(flat), "asyncpg") == expected
+
+
+def test_render_default_renderer_is_sqlite3():
+    assert render(["SELECT ", param(1)]) == CompiledSql("SELECT ?", (1,))
+
+
+def test_compile_is_expand_then_render():
+    assert compile(AGE_QUERY, "duckdb") == render(expand(AGE_QUERY), "duckdb") == template(*AGE_QUERY).compile("duckdb")
 
 
 def test_unknown_paramstyle_raises():
